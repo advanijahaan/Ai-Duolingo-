@@ -62,6 +62,17 @@ class Config:
     crypto_learn_days: int = 30
     crypto_cost_pct: float = 0.005   # Alpaca crypto fees are ~0.25% per side
     min_order_dollars: float = 10.0
+    # Short selling: bet on falling prices (stocks Alpaca can borrow; never crypto)
+    allow_shorts: bool = True
+    # Options: on these liquid names, signals buy calls (bullish) or puts (bearish) instead of shares
+    options_underlyings: list = field(default_factory=lambda: [
+        "SPY", "QQQ", "IWM", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "META", "AMZN", "GOOGL", "AVGO"])
+    option_min_days: int = 7          # skip contracts expiring sooner (time decay is brutal)
+    option_max_days: int = 21
+    option_target_delta: float = 0.5  # at-the-money-ish
+    option_max_spread: float = 0.15   # skip if (ask - bid) / mid is wider than this
+    option_stop_pct: float = 0.5      # sell if the option loses half its value
+    option_take_profit_pct: float = 1.0  # sell if it doubles
     timeframe: str = "5Min"
     poll_seconds: int = 60
 
@@ -125,6 +136,10 @@ class Config:
             cfg.world_symbols = []
         if os.getenv("BOT_SCAN_STOCKS", "").lower() in ("0", "off", "false", "no"):
             cfg.scan_stocks = False
+        if os.getenv("BOT_OPTIONS", "").lower() in ("0", "off", "false", "no"):
+            cfg.options_underlyings = []
+        if os.getenv("BOT_SHORTS", "").lower() in ("0", "off", "false", "no"):
+            cfg.allow_shorts = False
         crypto = os.getenv("BOT_CRYPTO", "")
         if crypto.lower() in ("0", "off", "false", "no"):
             cfg.crypto_symbols = []

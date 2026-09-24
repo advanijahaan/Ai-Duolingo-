@@ -3,7 +3,8 @@ Duolingo for free
 
 ## AI day-trading bot (Alpaca paper trading)
 
-A bot that trades with **fake money** on Alpaca's paper account, in **US stocks and crypto**. It learns which
+A bot that trades with **fake money** on Alpaca's paper account: **US and world stocks, options and crypto**.
+It bets on prices going **up and down**. It learns which
 strategy works for each one and switches on its own.
 
 **What it trades:**
@@ -14,6 +15,11 @@ strategy works for each one and switches on its own.
   - Countries and regions: Europe, Japan, China, India, Brazil, UK, Canada, Korea, Taiwan, emerging markets.
   - Big foreign companies: TSMC, ASML, Alibaba, Novo Nordisk, SAP, Shell, BP, Shopify, MercadoLibre and more.
   - Gold, silver, oil, natural gas and US Treasury bonds.
+- **Options:** on SPY, QQQ, IWM, AAPL, MSFT, NVDA, AMD, TSLA, META, AMZN, GOOGL and AVGO, the bot buys **calls**
+  when it expects a rise and **puts** when it expects a fall, instead of the shares. It uses contracts expiring
+  in 1 to 3 weeks, near the current price. The most it can lose is what it paid. It sells if the option drops
+  50% or doubles, and sells all options before the close.
+- **Short selling:** on other stocks Alpaca allows, it can bet on a fall by shorting.
 - **Crypto:** BTC, ETH, SOL, XRP, DOGE, LTC, AVAX, LINK, ADA and DOT. It trades **24/7**, including nights and weekends.
 
 ### How to see what it's making (phone or computer)
@@ -42,21 +48,25 @@ It sells all stocks a few minutes before the market closes. Crypto positions can
 6. **Test it** (places no orders): `python -m trading_bot.bot --dry-run --once`
 7. **Start it:** `python -m trading_bot.bot`
    Leave the window open for as long as you want it to trade. Close it or press **Ctrl+C** to stop.
-   Stock trades keep their automatic stop-loss and take-profit orders after you stop. Crypto doesn't support those
-   orders, so the bot watches crypto stop-losses itself. If you stop the bot while it owns crypto, sell it in the
-   Alpaca app or start the bot again.
+   Stock trades keep their automatic stop-loss and take-profit orders after you stop. Crypto and options don't
+   support those orders, so the bot watches their stop-losses itself. If you stop the bot while it owns crypto
+   or options, sell them in the Alpaca app or start the bot again.
 
 To see what the AI has learned and which strategy each stock and coin is using: `python -m trading_bot.bot --report`
 
 ### How the AI works
 
-The bot has 3 strategies:
+The bot has 3 strategies, each in an "up" version and a "down" (`_short`) version. That makes 6 in total:
 
 | Strategy | Buys when… | Sells when… |
 |---|---|---|
 | `trend` | the short-term average price crosses above the longer-term one | it crosses back below |
 | `mean_reversion` | a stock that dropped too far starts bouncing back (RSI climbs back above 30) | price gets back to its average |
 | `breakout` | price breaks above its recent high on heavy volume | price falls below its recent low |
+
+The `_short` versions (`trend_short`, `mean_reversion_short`, `breakout_short`) are the mirror images. They bet on
+a fall by shorting the stock or buying a put. Crypto only uses the "up" versions because Alpaca doesn't allow
+shorting crypto.
 
 For each stock (every 5 minutes) and each coin (every hour), the bot:
 1. **Replays** all 3 strategies on recent prices to see which would have made money after fees. It uses the last
@@ -69,6 +79,7 @@ For each stock (every 5 minutes) and each coin (every hour), the bot:
 It doesn't trust a strategy because of a few lucky trades. A strategy needs a steady record before the bot uses it.
 
 **Safety limits:** every buy comes with a stop-loss and a take-profit. Each trade risks about 1% of the account.
+Options risk about 1% of the account each, counting a 50% drop as the full loss.
 No single stock or coin gets more than 20% of the money, and the bot holds at most 8 at once. If the account is down 3% on
 the day, it sells everything and stops until the next day. It won't connect to a real-money account unless you set
 `ALPACA_ALLOW_LIVE=1`.
@@ -78,6 +89,8 @@ that a strategy works. You can also add these lines to `.env`:
 - `BOT_SYMBOLS=SPY,AAPL`: stocks to always watch
 - `BOT_SCAN_STOCKS=off`: stop adding the most-traded stocks
 - `BOT_WORLD=off`: no world markets
+- `BOT_OPTIONS=off`: trade shares instead of options
+- `BOT_SHORTS=off`: only bet on prices going up
 - `BOT_CRYPTO=BTC/USD,ETH/USD`: choose your own coins
 - `BOT_CRYPTO=off`: no crypto
 

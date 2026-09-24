@@ -1,4 +1,7 @@
-"""Self-learning paper-trading bot for Alpaca: US and world-market stocks/ETFs during US hours, crypto 24/7.
+"""Self-learning paper-trading bot for Alpaca.
+
+Trades US and world-market stocks/ETFs (long and short) and options (calls and puts)
+during US market hours, and crypto 24/7.
 
 Run:  python -m trading_bot.bot            # trade in a loop
       python -m trading_bot.bot --once     # single pass, then exit
@@ -8,14 +11,15 @@ Run:  python -m trading_bot.bot            # trade in a loop
 import argparse
 import logging
 import time
+import math
 import uuid
 from datetime import datetime, timedelta
 
 from .alpaca_client import AlpacaClient, AlpacaError, is_crypto, norm
 from .config import Config
 from .learner import Learner
-from .risk import daily_loss_hit, position_size
-from .strategy import STRATEGIES
+from .risk import daily_loss_hit, option_contracts, pick_option, position_size
+from .strategy import LONG_STRATEGIES, STRATEGIES
 
 log = logging.getLogger("trading_bot")
 
@@ -49,6 +53,7 @@ class TradingBot:
         self.halted_day = None
         self.scanned = []
         self.scanned_at = None
+        self.shortable_cache = {}
 
     @property
     def open_trades(self):
@@ -69,7 +74,30 @@ class TradingBot:
             except AlpacaError as exc:
                 log.error("Stock scan failed, keeping previous list: %s", exc)
         held = [s for s in self.open_trades if not is_crypto(s)]
-        return list(dict.fromkeys(self.cfg.symbols + self.cfg.world_symbols + self.scanned + held))
+        held += [t["underlying"] for t in self.open_trades.values() if t.get("underlying")]
+        return list(dict.fromkeys(self.cfg.symbols + self.cfg.options_underlyings + self.cfg.world_symbols
+                                  + self.scanned + held))
+
+    def _shortable(self, symbol):
+        if symbol not in self.shortable_cache:
+            try:
+                asset = self.client.get_asset(symbol)
+                self.shortable_cache[symbol] = bool(asset.get("shortable") and asset.get("easy_to_borrow"))
+            except AlpacaError:
+                return False
+        return self.shortable_cache[symbol]
+
+    def _allowed(self, symbol):
+        """Which strategies a symbol may use: shorts need options (puts) or a borrowable stock."""
+        if is_crypto(symbol) or not self.cfg.allow_shorts:
+            return list(LONG_STRATEGIES)
+        if symbol in self.cfg.options_underlyings or self._shortable(symbol):
+            return list(STRATEGIES)
+        return list(LONG_STRATEGIES)
+
+    @staticmethod
+    def _is_entry_order(order):
+        return order.get("client_order_id", "").split("-")[0] in STRATEGIES
 
     def _timeframe(self, symbol):
         return self.cfg.crypto_timeframe if is_crypto(symbol) else self.cfg.timeframe
@@ -91,7 +119,8 @@ class TradingBot:
         now = _parse_ts(clock["timestamp"])
         stock_open = clock["is_open"]
         positions = {norm(p["symbol"]): p for p in self.client.get_positions() or []}
-        pending = {norm(o["symbol"]) for o in self.client.get_open_orders() or [] if o["side"] == "buy"}
+        entry_orders = [o for o in self.client.get_open_orders() or [] if self._is_entry_order(o)]
+        pending = {norm(o["symbol"]) for o in entry_orders}
         self._learn_from_closed_trades(positions, pending)
 
         account = self.client.get_account()
@@ -110,11 +139,15 @@ class TradingBot:
             self.halted_day = today
             return
 
-        self._check_crypto_exits(positions)
+        self._check_managed_exits(positions)
 
         symbols = list(self.cfg.crypto_symbols)
         if stock_open:
             if minutes_to_close <= self.cfg.flatten_minutes:
+                for order in entry_orders:
+                    if not is_crypto(order["symbol"]):
+                        self._act(f"CANCEL unfilled {order['symbol']} entry (end of day)",
+                                  lambda o=order: self.client.cancel_order(o["id"]))
                 self._flatten(positions, "end of day", stocks_only=True)
             else:
                 symbols = self.stock_universe(now) + symbols
@@ -131,7 +164,7 @@ class TradingBot:
                 continue
             if bars and self.last_bar_seen.get(symbol) != bars[-1]["t"]:
                 self.last_bar_seen[symbol] = bars[-1]["t"]
-                self.learner.update(symbol, bars)
+                self.learner.update(symbol, bars, self._allowed(symbol))
                 fresh[symbol] = bars
 
         # 2) pick a strategy per symbol and act on it
@@ -153,20 +186,25 @@ class TradingBot:
                      ", ".join(f"{k} {v:+.2f}R" for k, v in scores.items()))
         self.learner.state["active"][symbol] = choice
 
-        if key in positions:
-            # exits follow the strategy that opened the trade
-            owner = self.open_trades.get(symbol, {}).get("strategy") or choice or "trend"
+        # exits follow the strategy that opened the trade (shares, or an option on this underlying)
+        options_held = [c for c, t in self.open_trades.items() if t.get("underlying") == symbol]
+        for held in ([key] if key in positions else []) + [c for c in options_held if c in positions]:
+            trade = self.open_trades.get(symbol if held == key else held, {})
+            owner = trade.get("strategy") or choice or "trend"
             signal = STRATEGIES[owner](bars, self.cfg)
-            log.info("%-9s [%s] holding: %s", symbol, owner, signal.reason)
+            log.info("%-9s [%s] holding %s: %s", symbol, owner, held, signal.reason)
             if signal.action == "sell":
-                self._act(f"SELL {symbol} (exit, {owner})", lambda: self.client.close_position(symbol))
-                positions.pop(key)
+                target = symbol if held == key else held
+                self._act(f"EXIT {target} ({owner})", lambda: self.client.close_position(target))
+                positions.pop(held, None)
+        if key in positions or options_held:
             return
 
         if choice is None or key in pending:
             return
         signal = STRATEGIES[choice](bars, self.cfg)
-        log.info("%-9s [%s] %s: %s", symbol, choice, signal.action.upper(), signal.reason)
+        log.info("%-9s [%s] %s: %s", symbol, choice, "SHORT" if signal.action == "buy" and signal.side == "short"
+                 else signal.action.upper(), signal.reason)
         if signal.action != "buy":
             return
         if not allow_entries:
@@ -175,31 +213,76 @@ class TradingBot:
         if len(positions) + len(pending) >= self.cfg.max_open_positions:
             log.info("%s: max open positions reached", symbol)
             return
+
+        if symbol in self.cfg.options_underlyings:
+            if self._enter_option(symbol, choice, signal, bars, account):
+                pending.add(key)
+                return
+            if signal.side == "short" and not self._shortable(symbol):
+                return
+
         crypto = is_crypto(symbol)
         cash = account["non_marginable_buying_power"] if crypto else account["buying_power"]
         qty = position_size(float(account["equity"]), float(cash), signal.price, signal.stop, self.cfg,
-                            fractional=crypto)
+                            fractional=crypto, side=signal.side)
         if not qty:
             log.info("%s: position size too small", symbol)
             return
+        order_side = "buy" if signal.side == "long" else "sell"
         order_id = f"{choice}-{key}-{uuid.uuid4().hex[:8]}"
         self._act(
-            f"BUY {qty} {symbol} @ ~{signal.price:.4g} stop {signal.stop:.4g} target {signal.target:.4g} ({choice})",
-            lambda: self.client.submit_buy(symbol, qty, signal.target, signal.stop, order_id),
+            f"{'BUY' if order_side == 'buy' else 'SHORT'} {qty} {symbol} @ ~{signal.price:.4g} "
+            f"stop {signal.stop:.4g} target {signal.target:.4g} ({choice})",
+            lambda: self.client.submit_entry(symbol, qty, order_side, signal.target, signal.stop, order_id),
         )
         pending.add(key)
         if not self.dry_run:
-            self.open_trades[symbol] = {"strategy": choice, "entry": signal.price, "stop": signal.stop,
-                                        "target": signal.target, "opened_at": bars[-1]["t"]}
+            self.open_trades[symbol] = {"strategy": choice, "side": signal.side, "entry": signal.price,
+                                        "stop": signal.stop, "target": signal.target, "opened_at": bars[-1]["t"],
+                                        "managed": crypto}
 
-    def _check_crypto_exits(self, positions):
-        """Crypto has no bracket orders, so enforce the stop-loss and take-profit here every loop."""
+    def _enter_option(self, symbol, choice, signal, bars, account):
+        """Buy a call (bullish) or put (bearish). Returns False if no good contract was found."""
+        kind = "call" if signal.side == "long" else "put"
+        today = _parse_ts(bars[-1]["t"]).date()
+        try:
+            candidates = self.client.get_option_candidates(
+                symbol, kind, signal.price, today + timedelta(days=self.cfg.option_min_days),
+                today + timedelta(days=self.cfg.option_max_days))
+        except AlpacaError as exc:
+            log.error("%s options: %s", symbol, exc)
+            return False
+        contract = pick_option(candidates, self.cfg)
+        if not contract:
+            log.info("%s: no liquid %s found, trading the shares instead", symbol, kind)
+            return False
+        cash = float(account.get("options_buying_power") or account["buying_power"])
+        qty = option_contracts(float(account["equity"]), cash, contract["ask"], self.cfg)
+        if qty < 1:
+            log.info("%s: option too expensive for the risk limit", symbol)
+            return False
+        occ, ask = contract["symbol"], contract["ask"]
+        order_id = f"{choice}-{occ}-{uuid.uuid4().hex[:8]}"
+        self._act(
+            f"BUY {qty} {symbol} {kind.upper()} {occ} @ {ask:.2f} (delta {contract['delta']:+.2f}, "
+            f"expires {contract['expiration']}) ({choice})",
+            lambda: self.client.submit_option_buy(occ, qty, ask, order_id),
+        )
+        if not self.dry_run:
+            self.open_trades[occ] = {
+                "strategy": choice, "side": "long", "underlying": symbol, "entry": ask,
+                "stop": ask * (1 - self.cfg.option_stop_pct), "target": ask * (1 + self.cfg.option_take_profit_pct),
+                "opened_at": bars[-1]["t"], "managed": True}
+        return True
+
+    def _check_managed_exits(self, positions):
+        """Crypto and options have no bracket orders, so enforce their stop-loss and take-profit here every loop."""
         for symbol, trade in self.open_trades.items():
             pos = positions.get(norm(symbol))
-            if not is_crypto(symbol) or not pos:
+            if not trade.get("managed", is_crypto(symbol)) or not pos:
                 continue
             price = float(pos["current_price"])
-            if price <= trade["stop"] or price >= trade.get("target", float("inf")):
+            if price <= trade["stop"] or price >= trade.get("target", math.inf):
                 why = "stop-loss" if price <= trade["stop"] else "take-profit"
                 try:
                     self._act(f"SELL {symbol} @ ~{price:.4g} ({why})", lambda: self.client.close_position(symbol))
@@ -216,11 +299,14 @@ class TradingBot:
                 continue
             if key in pending:
                 continue
-            exit_price = self.client.get_last_sell_fill(symbol, trade["opened_at"])  # None if the buy never filled
+            short = trade.get("side") == "short"
+            # None if the entry never filled
+            exit_price = self.client.get_last_exit_fill(symbol, trade["opened_at"], "buy" if short else "sell")
             if exit_price is not None:
-                r = (exit_price - trade["entry"]) / (trade["entry"] - trade["stop"])
+                risk = abs(trade["entry"] - trade["stop"])
+                r = ((trade["entry"] - exit_price) if short else (exit_price - trade["entry"])) / risk
                 log.info("%s: trade closed at %.4g, %+.2fR -> learning for %s", symbol, exit_price, r, trade["strategy"])
-                self.learner.record_trade(symbol, trade["strategy"], r)
+                self.learner.record_trade(trade.get("underlying", symbol), trade["strategy"], r)
             del self.open_trades[symbol]
             self.learner.save()
 
@@ -248,7 +334,7 @@ class TradingBot:
         now = _parse_ts(self.client.get_clock()["timestamp"])
         symbols = self.stock_universe(now) + list(self.cfg.crypto_symbols)
         for symbol in symbols:
-            self.learner.update(symbol, self._get_bars(symbol, now))
+            self.learner.update(symbol, self._get_bars(symbol, now), self._allowed(symbol))
         print(f"{'symbol':9} {'strategy':15} {'score':>7} {'replay trades':>13} {'replay R':>9} "
               f"{'real trades':>11} {'real R':>7}")
         using = []
@@ -265,9 +351,10 @@ class TradingBot:
         print(f"Trading {len(using)} of {len(symbols)}: {', '.join(using) or 'none right now'}")
 
     def run_forever(self):
-        log.info("Trading %d stocks + %d world%s + %d crypto on %s (%s)", len(self.cfg.symbols),
-                 len(self.cfg.world_symbols), " + daily most-traded scan" if self.cfg.scan_stocks else "",
-                 len(self.cfg.crypto_symbols),
+        log.info("Trading %d stocks + %d options underlyings + %d world%s + %d crypto, shorts %s, on %s (%s)",
+                 len(self.cfg.symbols), len(self.cfg.options_underlyings), len(self.cfg.world_symbols),
+                 " + daily most-traded scan" if self.cfg.scan_stocks else "", len(self.cfg.crypto_symbols),
+                 "on" if self.cfg.allow_shorts else "off",
                  self.cfg.base_url, "DRY RUN" if self.dry_run else "paper orders")
         while True:
             try:
@@ -299,7 +386,7 @@ def main():
             bot.run_forever()
         except KeyboardInterrupt:
             log.info("Stopped. Stock trades keep their stop-loss/take-profit orders; "
-                     "crypto stops are only watched while the bot runs.")
+                     "crypto and option stops are only watched while the bot runs.")
 
 
 if __name__ == "__main__":

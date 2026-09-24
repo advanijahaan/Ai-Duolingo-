@@ -5,11 +5,11 @@ from unittest import mock
 
 from trading_bot.bot import TradingBot, completed_bars
 from trading_bot.config import Config
-from trading_bot.risk import daily_loss_hit, position_size
+from trading_bot.risk import daily_loss_hit, option_contracts, pick_option, position_size
 import tempfile
 
 from trading_bot.learner import Learner, backtest
-from trading_bot.strategy import Signal, atr, breakout, ema, mean_reversion, rsi, trend
+from trading_bot.strategy import STRATEGIES, Signal, atr, breakout, ema, mean_reversion, mirror, rsi, trend
 
 T0 = datetime(2026, 9, 24, 14, 0, tzinfo=timezone.utc)
 
@@ -30,6 +30,7 @@ def cfg(**kw):
     c.symbols = ["AAPL"]
     c.scan_stocks = False
     c.world_symbols = []
+    c.options_underlyings = []
     c.crypto_symbols = []
     c.crypto_timeframe = "5Min"
     c.state_file = os.path.join(STATE_DIR, f"state-{id(c)}.json")
@@ -163,6 +164,35 @@ class LearnerTests(unittest.TestCase):
         self.assertNotEqual(reloaded.choose("AAPL")[0], "trend")
 
 
+class ShortAndOptionTests(unittest.TestCase):
+    def test_mirror_keeps_last_close_and_flips_direction(self):
+        bars = make_bars([100.0, 110.0, 120.0])
+        m = mirror(bars)
+        self.assertAlmostEqual(m[-1]["c"], 120.0)
+        self.assertGreater(m[0]["c"], m[-1]["c"])
+        self.assertTrue(all(b["h"] >= b["l"] for b in m))
+
+    def test_short_signal_has_stop_above(self):
+        sig = STRATEGIES["trend_short"](make_bars(bearish_series()), cfg())
+        self.assertEqual((sig.action, sig.side), ("buy", "short"))
+        self.assertGreater(sig.stop, sig.price)
+        self.assertLess(sig.target, sig.price)
+
+    def test_short_size(self):
+        self.assertEqual(position_size(100_000, 1e9, 100, 110, cfg(), side="short"), 100)
+
+    def test_pick_option(self):
+        opts = [option("call", "far", 0.8, 5.0, 5.1), option("call", "atm", 0.49, 2.0, 2.1),
+                option("call", "wide", 0.5, 1.0, 2.0), option("call", "atm_later", 0.5, 2.5, 2.6, exp="2026-10-16")]
+        self.assertEqual(pick_option(opts, cfg())["symbol"], "atm")
+        self.assertIsNone(pick_option([opts[2]], cfg()))
+
+    def test_option_contracts(self):
+        # $1000 risk / ($210 * 50%) = 9.5 -> 9; cap 20% = $20k / $210 = 95
+        self.assertEqual(option_contracts(100_000, 1e9, 2.1, cfg()), 9)
+        self.assertEqual(option_contracts(100_000, 300, 2.1, cfg()), 1)
+
+
 class RiskTests(unittest.TestCase):
     def test_size_by_risk(self):
         # risk $1000 (1% of 100k), $2/share -> 500 shares, cap 20% = 200 shares at $100
@@ -202,7 +232,7 @@ class ConfigTests(unittest.TestCase):
 
 class FakeClient:
     def __init__(self, bars, positions=(), minutes_to_close=120, equity="100000", last_equity="100000",
-                 is_open=True, actives=()):
+                 is_open=True, actives=(), shortable=True, options=()):
         self.bars = bars
         self.positions = list(positions)
         self.now = datetime.fromisoformat(bars[-1]["t"].replace("Z", "+00:00")) + timedelta(minutes=5)
@@ -213,6 +243,8 @@ class FakeClient:
         self.open_orders = []
         self.is_open, self.actives = is_open, list(actives)
         self.bar_requests = []
+        self.shortable, self.options = shortable, list(options)
+        self.option_orders, self.canceled, self.exit_sides = [], [], []
 
     def get_clock(self):
         return {"is_open": self.is_open, "timestamp": self.now.isoformat(),
@@ -235,12 +267,27 @@ class FakeClient:
         self.bar_requests.append(symbol)
         return self.bars
 
-    def get_last_sell_fill(self, symbol, after):
+    def get_last_exit_fill(self, symbol, after, exit_side="sell"):
+        self.exit_sides.append(exit_side)
         return self.sell_fill
 
-    def submit_buy(self, symbol, qty, tp, sl, client_order_id=None):
+    def get_asset(self, symbol):
+        return {"shortable": self.shortable, "easy_to_borrow": self.shortable}
+
+    def get_option_candidates(self, underlying, kind, price, exp_from, exp_to):
+        return [o for o in self.options if o["kind"] == kind]
+
+    def submit_option_buy(self, contract, qty, limit_price, client_order_id=None):
+        self.option_orders.append((contract, qty, limit_price))
+        self.open_orders.append({"id": "o1", "symbol": contract, "side": "buy", "client_order_id": client_order_id})
+
+    def cancel_order(self, order_id):
+        self.canceled.append(order_id)
+
+    def submit_entry(self, symbol, qty, side, tp, sl, client_order_id=None):
         self.orders.append((symbol, qty, tp, sl))
-        self.open_orders.append({"symbol": symbol, "side": "buy"})
+        self.sides = getattr(self, "sides", []) + [side]
+        self.open_orders.append({"id": "e1", "symbol": symbol, "side": side, "client_order_id": client_order_id})
         self.order_ids = getattr(self, "order_ids", []) + [client_order_id]
 
     def close_position(self, symbol):
@@ -251,11 +298,31 @@ class FakeClient:
         self.closed_all += 1
 
 
-def trend_learner(c=None):
-    """Learner whose replay always says trend wins, so bot tests are deterministic."""
+def trend_learner(c=None, short=False):
+    """Learner whose replay always says trend (or trend_short) wins, so bot tests are deterministic.
+
+    Short strategies are replayed as their long twin on a flipped chart, so tell them apart by the prices.
+    """
     def fake_backtest(fn, bars, c, **kw):
-        return [1.0] * 10 if fn is trend else [-1.0] * 10
+        flipped = bars and bars[0]["c"] > 100
+        if fn is trend and flipped == short:
+            return [1.0] * 10
+        return [-1.0] * 10
     return Learner(c or cfg(), backtester=fake_backtest)
+
+
+UP_THEN_DOWN = [100 + 0.3 * i for i in range(30)] + [109 - i for i in range(15)]
+
+
+def bearish_series():
+    for n in range(25, len(UP_THEN_DOWN) + 1):
+        if STRATEGIES["trend_short"](make_bars(UP_THEN_DOWN[:n]), cfg()).action == "buy":
+            return UP_THEN_DOWN[:n]
+    raise AssertionError("fixture never crosses down")
+
+
+def option(kind, symbol, delta, bid, ask, exp="2026-10-09"):
+    return {"kind": kind, "symbol": symbol, "delta": delta, "bid": bid, "ask": ask, "expiration": exp, "strike": 100}
 
 
 class BotTests(unittest.TestCase):
@@ -350,6 +417,80 @@ class BotTests(unittest.TestCase):
         bot.run_once()
         bot.run_once()
         self.assertEqual(client.bar_requests, ["AAPL"])
+
+    def test_short_sells_borrowable_stock(self):
+        client = FakeClient(make_bars(bearish_series()))
+        bot = TradingBot(cfg(), learner=trend_learner(short=True), client=client)
+        bot.run_once()
+        self.assertEqual(client.sides, ["sell"])
+        symbol, qty, tp, sl = client.orders[0]
+        self.assertGreater(sl, tp)  # stop above, target below
+        self.assertEqual(bot.open_trades["AAPL"]["side"], "short")
+
+    def test_no_short_when_not_borrowable(self):
+        client = FakeClient(make_bars(bearish_series()), shortable=False)
+        bot = TradingBot(cfg(), learner=trend_learner(short=True), client=client)
+        bot.run_once()
+        self.assertEqual(client.orders, [])
+        self.assertNotIn("trend_short", bot.learner.allowed["AAPL"])
+
+    def test_learns_from_closed_short(self):
+        client = FakeClient(make_bars(bearish_series()))
+        bot = TradingBot(cfg(), learner=trend_learner(short=True), client=client)
+        bot.open_trades["AAPL"] = {"strategy": "trend_short", "side": "short", "entry": 100.0, "stop": 102.0,
+                                   "opened_at": "x"}
+        client.sell_fill = 96.0
+        bot.run_once()
+        self.assertEqual(client.exit_sides[0], "buy")
+        self.assertEqual(bot.learner.state["live_results"]["trend_short"]["AAPL"], [2.0])
+
+    def test_bullish_signal_buys_call_on_options_name(self):
+        c = cfg(options_underlyings=["AAPL"])
+        client = FakeClient(make_bars(crossover_series()),
+                            options=[option("call", "AAPL261009C00100000", 0.52, 2.0, 2.1),
+                                     option("put", "AAPL261009P00100000", -0.5, 2.0, 2.1)])
+        bot = TradingBot(c, learner=trend_learner(c), client=client)
+        bot.run_once()
+        self.assertEqual(client.orders, [])  # no shares
+        contract, qty, limit = client.option_orders[0]
+        self.assertEqual(contract, "AAPL261009C00100000")
+        self.assertEqual(limit, 2.1)
+        trade = bot.open_trades[contract]
+        self.assertEqual((trade["underlying"], trade["stop"], trade["target"]), ("AAPL", 1.05, 4.2))
+
+    def test_bearish_signal_buys_put(self):
+        c = cfg(options_underlyings=["AAPL"])
+        client = FakeClient(make_bars(bearish_series()), shortable=False,
+                            options=[option("put", "AAPL261009P00100000", -0.48, 2.0, 2.1)])
+        TradingBot(c, learner=trend_learner(c, short=True), client=client).run_once()
+        self.assertEqual(client.option_orders[0][0], "AAPL261009P00100000")
+        self.assertEqual(client.orders, [])
+
+    def test_falls_back_to_shares_without_liquid_option(self):
+        c = cfg(options_underlyings=["AAPL"])
+        client = FakeClient(make_bars(crossover_series()), options=[option("call", "WIDE", 0.5, 1.0, 2.0)])
+        TradingBot(c, learner=trend_learner(c), client=client).run_once()
+        self.assertEqual(client.option_orders, [])
+        self.assertEqual(len(client.orders), 1)
+
+    def test_option_stop_enforced_by_bot(self):
+        occ = "AAPL261009C00100000"
+        client = FakeClient(make_bars(crossover_series()),
+                            positions=[{"symbol": occ, "asset_class": "us_option", "avg_entry_price": "2.0",
+                                        "current_price": "0.9"}])
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        bot.open_trades[occ] = {"strategy": "trend", "side": "long", "underlying": "AAPL", "entry": 2.0,
+                                "stop": 1.0, "target": 4.0, "opened_at": "x", "managed": True}
+        bot.run_once()
+        self.assertEqual(client.closed, [occ])
+
+    def test_end_of_day_cancels_unfilled_entries(self):
+        client = FakeClient(make_bars(crossover_series()), minutes_to_close=5)
+        client.open_orders = [{"id": "abc", "symbol": "AAPL261009C00100000", "side": "buy",
+                               "client_order_id": "trend-AAPL261009C00100000-1234"},
+                              {"id": "leg", "symbol": "MSFT", "side": "sell", "client_order_id": "uuid-ish"}]
+        TradingBot(cfg(), learner=trend_learner(), client=client).run_once()
+        self.assertEqual(client.canceled, ["abc"])
 
     def test_drops_forming_bar(self):
         bars = make_bars([1, 2, 3])

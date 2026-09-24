@@ -2,12 +2,15 @@
 
 Each strategy looks at closed bars (oldest first, Alpaca keys o/h/l/c/v) and
 returns a Signal for the latest bar:
-  * "buy"  - open a long position, with an ATR-based stop and target
+  * "buy"  - open a position, with an ATR-based stop and target
   * "sell" - exit an open position
   * "hold" - do nothing
+Every strategy also has a "_short" twin that bets on prices falling. It runs the
+same rules on an upside-down price chart (see mirror). For a short, stop is
+above the price and target is below it.
 The learner (learner.py) decides which strategy each symbol should use.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 def ema(values, period):
@@ -59,6 +62,7 @@ class Signal:
     stop: float = 0.0
     target: float = 0.0
     reason: str = ""
+    side: str = "long"
 
 
 def trend(bars, cfg):
@@ -136,4 +140,29 @@ def _entry(bars, cfg, stop_mult, target_mult, reason):
                   reason=f"{reason}, ATR {vol:.2f}")
 
 
-STRATEGIES = {"trend": trend, "mean_reversion": mean_reversion, "breakout": breakout}
+def mirror(bars, k=None):
+    """Flip the chart upside down (price -> k/price) so a falling market looks like a rising one.
+
+    With k = last close**2 the last close is unchanged, and prices map back the same way.
+    """
+    k = k or bars[-1]["c"] ** 2
+    return [{"t": b["t"], "o": k / b["o"], "h": k / b["l"], "l": k / b["h"], "c": k / b["c"], "v": b["v"]}
+            for b in bars]
+
+
+def short_version(fn):
+    def short(bars, cfg):
+        k = bars[-1]["c"] ** 2
+        sig = fn(mirror(bars, k), cfg)
+        if sig.action == "buy":
+            sig = replace(sig, stop=k / sig.stop, target=k / sig.target)
+        return replace(sig, side="short", price=bars[-1]["c"] if bars else 0.0,
+                       reason=f"{sig.reason} (on flipped chart)")
+    short.__name__ = fn.__name__ + "_short"
+    short.base = fn
+    return short
+
+
+LONG_STRATEGIES = {"trend": trend, "mean_reversion": mean_reversion, "breakout": breakout}
+STRATEGIES = dict(LONG_STRATEGIES)
+STRATEGIES.update({f"{name}_short": short_version(fn) for name, fn in LONG_STRATEGIES.items()})

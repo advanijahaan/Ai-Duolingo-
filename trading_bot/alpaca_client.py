@@ -51,8 +51,15 @@ class AlpacaClient:
         return self._trade("GET", "/orders", params={"status": "open", "limit": 500})
 
     # --- orders ---
-    def submit_buy(self, symbol, qty, take_profit, stop_loss, client_order_id=None):
-        """Stocks get a bracket order. Crypto can't use brackets, so the bot watches its stop/target itself."""
+    def get_asset(self, symbol):
+        return self._trade("GET", f"/assets/{symbol}")
+
+    def submit_entry(self, symbol, qty, side, take_profit, stop_loss, client_order_id=None):
+        """Open a position. side is "buy" (long) or "sell" (short).
+
+        Stocks get a bracket order. Crypto can't use brackets (and can't be shorted),
+        so the bot watches its stop/target itself.
+        """
         if is_crypto(symbol):
             body = {"symbol": symbol, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "gtc"}
             if client_order_id:
@@ -61,7 +68,7 @@ class AlpacaClient:
         body = {
             "symbol": symbol,
             "qty": str(qty),
-            "side": "buy",
+            "side": side,
             "type": "market",
             "time_in_force": "day",
             "order_class": "bracket",
@@ -72,8 +79,40 @@ class AlpacaClient:
             body["client_order_id"] = client_order_id
         return self._trade("POST", "/orders", json=body)
 
-    def get_last_sell_fill(self, symbol, after):
-        """Average fill price of the most recent filled sell of `symbol` since `after` (ISO time)."""
+    def submit_option_buy(self, contract, qty, limit_price, client_order_id=None):
+        body = {"symbol": contract, "qty": str(qty), "side": "buy", "type": "limit",
+                "limit_price": f"{limit_price:.2f}", "time_in_force": "day"}
+        if client_order_id:
+            body["client_order_id"] = client_order_id
+        return self._trade("POST", "/orders", json=body)
+
+    def get_option_candidates(self, underlying, kind, price, exp_from, exp_to, strike_pct=0.05):
+        """Tradable calls/puts near the money with live quotes and delta."""
+        contracts = self._trade("GET", "/options/contracts", params={
+            "underlying_symbols": underlying, "type": kind, "status": "active",
+            "expiration_date_gte": exp_from.isoformat(), "expiration_date_lte": exp_to.isoformat(),
+            "strike_price_gte": f"{price * (1 - strike_pct):.2f}",
+            "strike_price_lte": f"{price * (1 + strike_pct):.2f}", "limit": 100,
+        }).get("option_contracts") or []
+        contracts = [c for c in contracts if c.get("tradable")]
+        if not contracts:
+            return []
+        data_root = self.cfg.data_url.rsplit("/", 1)[0]
+        snaps = self._request("GET", f"{data_root}/v1beta1/options/snapshots", params={
+            "symbols": ",".join(c["symbol"] for c in contracts), "feed": "indicative",
+        }).get("snapshots") or {}
+        out = []
+        for c in contracts:
+            snap = snaps.get(c["symbol"]) or {}
+            quote, greeks = snap.get("latestQuote") or {}, snap.get("greeks") or {}
+            if quote.get("bp") and quote.get("ap") and greeks.get("delta") is not None:
+                out.append({"symbol": c["symbol"], "expiration": c["expiration_date"],
+                            "strike": float(c["strike_price"]), "bid": quote["bp"], "ask": quote["ap"],
+                            "delta": greeks["delta"]})
+        return out
+
+    def get_last_exit_fill(self, symbol, after, exit_side="sell"):
+        """Average fill price of the most recent filled exit order for `symbol` since `after` (ISO time)."""
         orders = self._trade("GET", "/orders", params={
             "status": "closed", "symbols": symbol, "after": after,
             "direction": "desc", "nested": "true", "limit": 50,
@@ -81,7 +120,7 @@ class AlpacaClient:
         fills = []
         for order in orders:
             for o in [order] + (order.get("legs") or []):
-                if o["side"] == "sell" and o["status"] == "filled" and o.get("filled_avg_price"):
+                if o["side"] == exit_side and o["status"] == "filled" and o.get("filled_avg_price"):
                     fills.append((o["filled_at"], float(o["filled_avg_price"])))
         return max(fills)[1] if fills else None
 
@@ -91,6 +130,9 @@ class AlpacaClient:
             if norm(order["symbol"]) == norm(symbol):
                 self._trade("DELETE", f"/orders/{order['id']}")
         return self._trade("DELETE", f"/positions/{norm(symbol)}")
+
+    def cancel_order(self, order_id):
+        return self._trade("DELETE", f"/orders/{order_id}")
 
     def close_all_positions(self):
         return self._trade("DELETE", "/positions", params={"cancel_orders": "true"})

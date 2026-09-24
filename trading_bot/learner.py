@@ -15,7 +15,7 @@ How it learns:
 import json
 import os
 
-from .strategy import STRATEGIES
+from .strategy import STRATEGIES, mirror
 
 WARMUP_BARS = 30   # bars needed before a strategy can signal
 WINDOW = 120       # bars handed to a strategy per step (bounds replay cost)
@@ -67,7 +67,8 @@ class Learner:
         self.strategies = strategies
         self.backtester = backtester
         self.state = self._load()
-        self.replay = {}  # symbol -> {strategy: [R, ...]} from the latest replay
+        self.replay = {}   # symbol -> {strategy: [R, ...]} from the latest replay
+        self.allowed = {}  # symbol -> strategy names it may use (e.g. no shorts for crypto)
 
     # --- persistence ---
     def _load(self):
@@ -112,23 +113,33 @@ class Learner:
     def _group(self, symbol):
         return "crypto" if "/" in symbol else "stock"
 
-    def update(self, symbol, bars):
-        """Replay all strategies on the latest bars for `symbol`."""
+    def update(self, symbol, bars, allowed=None):
+        """Replay the allowed strategies on the latest bars for `symbol`.
+
+        Short strategies are replayed as their long twin on the flipped chart.
+        """
         crypto = self._group(symbol) == "crypto"
         kwargs = {"eod_exit": not crypto, "cost_pct": self.cfg.crypto_cost_pct if crypto else self.cfg.cost_pct}
-        self.replay[symbol] = {name: self.backtester(fn, bars, self.cfg, **kwargs)
-                               for name, fn in self.strategies.items()}
+        names = [n for n in self.strategies if allowed is None or n in allowed]
+        self.allowed[symbol] = names
+        flipped = mirror(bars) if bars and any(hasattr(self.strategies[n], "base") for n in names) else bars
+        self.replay[symbol] = {}
+        for name in names:
+            fn = self.strategies[name]
+            base = getattr(fn, "base", None)
+            self.replay[symbol][name] = (self.backtester(base, flipped, self.cfg, **kwargs) if base
+                                         else self.backtester(fn, bars, self.cfg, **kwargs))
 
     def choose(self, symbol):
         """Return (best strategy name or None to sit out, {name: score})."""
-        scores = {name: self.score(name, symbol) for name in self.strategies}
+        scores = {name: self.score(name, symbol) for name in self.allowed.get(symbol, self.strategies)}
         best = max(scores, key=scores.get)
         choice = best if scores[best] > self.cfg.min_score else None
         return choice, scores
 
     def scoreboard(self, symbol):
         rows = []
-        for name in self.strategies:
+        for name in self.allowed.get(symbol, self.strategies):
             replayed = self.replay.get(symbol, {}).get(name, [])
             live = self.state["live_results"].get(name, {}).get(symbol, [])
             rows.append((name, self.score(name, symbol), len(replayed),
