@@ -122,6 +122,7 @@ class TradingBot:
         entry_orders = [o for o in self.client.get_open_orders() or [] if self._is_entry_order(o)]
         pending = {norm(o["symbol"]) for o in entry_orders}
         self._learn_from_closed_trades(positions, pending)
+        self._protect_crypto(positions)
 
         account = self.client.get_account()
         minutes_to_close = (_parse_ts(clock["next_close"]) - now).total_seconds() / 60
@@ -275,6 +276,20 @@ class TradingBot:
                 "opened_at": bars[-1]["t"], "managed": True}
         return True
 
+    def _protect_crypto(self, positions):
+        """Once a crypto buy fills, park a stop-loss order at Alpaca so the position is protected
+        even if the bot goes offline. (Options can't have stop orders, so those stay bot-managed.)"""
+        for symbol, trade in self.open_trades.items():
+            pos = positions.get(norm(symbol))
+            if not is_crypto(symbol) or not pos or trade.get("stop_order_id") or self.dry_run:
+                continue
+            try:
+                order = self.client.submit_crypto_stop(symbol, pos["qty"], trade["stop"])
+                trade["stop_order_id"] = order["id"]
+                log.info("%s: stop-loss parked at Alpaca at %.4g", symbol, trade["stop"])
+            except AlpacaError as exc:
+                log.error("%s: could not place stop-loss: %s", symbol, exc)
+
     def _check_managed_exits(self, positions):
         """Crypto and options have no bracket orders, so enforce their stop-loss and take-profit here every loop."""
         for symbol, trade in self.open_trades.items():
@@ -361,6 +376,8 @@ class TradingBot:
                 self.run_once()
             except (AlpacaError, OSError) as exc:
                 log.error("Loop error: %s", exc)
+            except Exception:  # never let one bad response stop the bot
+                log.exception("Unexpected error, carrying on")
             time.sleep(self.cfg.poll_seconds)
 
 

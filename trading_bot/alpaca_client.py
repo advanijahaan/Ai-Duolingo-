@@ -1,6 +1,8 @@
 """Thin REST wrapper around the Alpaca trading and market-data APIs."""
 from datetime import datetime, timedelta, timezone
 
+import uuid
+
 import requests
 
 
@@ -130,6 +132,14 @@ class AlpacaClient:
             if norm(order["symbol"]) == norm(symbol):
                 self._trade("DELETE", f"/orders/{order['id']}")
         return self._trade("DELETE", f"/positions/{norm(symbol)}")
+
+    def submit_crypto_stop(self, symbol, qty, stop_price):
+        """Good-til-cancelled stop-limit sell that sits at Alpaca (limit 1% below the stop)."""
+        return self._trade("POST", "/orders", json={
+            "symbol": symbol, "qty": str(qty), "side": "sell", "type": "stop_limit",
+            "stop_price": f"{stop_price:.6g}", "limit_price": f"{stop_price * 0.99:.6g}",
+            "time_in_force": "gtc", "client_order_id": f"stop-{norm(symbol)}-{uuid.uuid4().hex[:8]}",
+        })
 
     def cancel_order(self, order_id):
         return self._trade("DELETE", f"/orders/{order_id}")

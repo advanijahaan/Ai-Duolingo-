@@ -4,3 +4,4 @@ __pycache__/
 bot.log
 bot_state.json
 bot_state.json.tmp
+.venv/

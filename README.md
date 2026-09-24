@@ -54,6 +54,34 @@ It sells all stocks a few minutes before the market closes. Crypto positions can
 
 To see what the AI has learned and which strategy each stock and coin is using: `python -m trading_bot.bot --report`
 
+### Keep it running 24/7 (free server, ~15 minutes, one time)
+
+Your computer has to stay on for the bot to run, so the best option is a small free server in the cloud.
+Once it's set up, you can close everything and it keeps trading. If it ever crashes, the server restarts it
+within 5 seconds, and it starts again on its own if the server reboots.
+
+1. Go to **https://console.cloud.google.com** and sign in with a Google account. Accept the free trial.
+   It asks for a card, but the server below is in Google's **always-free** tier.
+2. Open the menu (☰) → **Compute Engine** → **VM instances** → **Create instance**. Set:
+   - **Name:** `trading-bot`
+   - **Region:** `us-central1` (Iowa), `us-east1` or `us-west1`. Only these regions are free.
+   - **Machine type:** `e2-micro`
+   - **Boot disk:** click **Change** → **Ubuntu 24.04 LTS**, disk type **Standard persistent disk**, 30 GB
+   - Click **Create**.
+3. When it's ready, click the **SSH** button next to it. A black terminal window opens in your browser.
+4. Paste this and press Enter:
+   ```bash
+   sudo apt-get install -y git && git clone -b claude/jolly-mendel-hoavwy https://github.com/advanijahaan/Ai-Duolingo-.git && cd Ai-Duolingo- && bash deploy/install.sh
+   ```
+5. Paste your Alpaca paper **API Key ID** and **Secret Key** when it asks. It checks they work, then starts the bot.
+6. You'll see **Done!** You can close the window; the bot keeps running.
+
+To check on it later, click **SSH** again and run `tail -f Ai-Duolingo-/bot.log` (Ctrl+C to exit).
+
+⚠️ **Run only one copy of the bot at a time.** Two copies on the same Alpaca account would both place orders.
+
+Using Docker or a paid host instead? The `Dockerfile` works anywhere. Run it with `--restart always`, as shown at the top of that file.
+
 ### How the AI works
 
 The bot has 3 strategies, each in an "up" version and a "down" (`_short`) version. That makes 6 in total:

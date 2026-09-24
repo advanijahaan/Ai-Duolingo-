@@ -146,4 +146,5 @@ class Config:
         elif crypto:
             cfg.crypto_symbols = _env_list("BOT_CRYPTO", cfg.crypto_symbols)
         cfg.data_feed = os.getenv("ALPACA_DATA_FEED", cfg.data_feed)
+        cfg.state_file = os.getenv("BOT_STATE_FILE", cfg.state_file)
         return cfg

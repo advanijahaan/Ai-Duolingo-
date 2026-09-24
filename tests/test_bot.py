@@ -284,6 +284,10 @@ class FakeClient:
     def cancel_order(self, order_id):
         self.canceled.append(order_id)
 
+    def submit_crypto_stop(self, symbol, qty, stop_price):
+        self.stops = getattr(self, "stops", []) + [(symbol, qty, stop_price)]
+        return {"id": f"stop{len(self.stops)}"}
+
     def submit_entry(self, symbol, qty, side, tp, sl, client_order_id=None):
         self.orders.append((symbol, qty, tp, sl))
         self.sides = getattr(self, "sides", []) + [side]
@@ -393,10 +397,23 @@ class BotTests(unittest.TestCase):
         self.assertNotEqual(qty, int(qty))  # fractional coins
         self.assertIn("target", bot.open_trades["BTC/USD"])
 
+    def test_crypto_stop_parked_at_alpaca_once_filled(self):
+        c = cfg(crypto_symbols=["BTC/USD"])
+        client = FakeClient(make_bars(crossover_series()), is_open=False,
+                            positions=[{"symbol": "BTCUSD", "asset_class": "crypto", "qty": "0.5",
+                                        "avg_entry_price": "100", "current_price": "100"}])
+        bot = TradingBot(c, learner=trend_learner(c), client=client)
+        bot.open_trades["BTC/USD"] = {"strategy": "trend", "entry": 100.0, "stop": 98.0, "target": 104.0,
+                                      "opened_at": "x"}
+        bot.run_once()
+        bot.run_once()
+        self.assertEqual(client.stops, [("BTC/USD", "0.5", 98.0)])  # placed once, not every loop
+        self.assertEqual(bot.open_trades["BTC/USD"]["stop_order_id"], "stop1")
+
     def test_crypto_stop_loss_enforced_by_bot(self):
         c = cfg(crypto_symbols=["BTC/USD"])
         client = FakeClient(make_bars(crossover_series()), is_open=False,
-                            positions=[{"symbol": "BTCUSD", "asset_class": "crypto",
+                            positions=[{"symbol": "BTCUSD", "asset_class": "crypto", "qty": "0.5",
                                         "avg_entry_price": "100", "current_price": "97"}])
         bot = TradingBot(c, learner=trend_learner(c), client=client)
         bot.open_trades["BTC/USD"] = {"strategy": "trend", "entry": 100.0, "stop": 98.0, "target": 104.0,

@@ -1,0 +1,6 @@
+.env
+.git
+.venv
+bot.log
+bot_state.json*
+__pycache__
