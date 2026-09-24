@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 
 import uuid
+from urllib.parse import quote
 
 import requests
 
@@ -54,16 +55,17 @@ class AlpacaClient:
 
     # --- orders ---
     def get_asset(self, symbol):
-        return self._trade("GET", f"/assets/{symbol}")
+        return self._trade("GET", f"/assets/{quote(symbol, safe='')}")
 
-    def submit_entry(self, symbol, qty, side, take_profit, stop_loss, client_order_id=None):
+    def submit_entry(self, symbol, qty, side, take_profit, stop_loss, client_order_id=None, fractional=False):
         """Open a position. side is "buy" (long) or "sell" (short).
 
-        Stocks get a bracket order. Crypto can't use brackets (and can't be shorted),
-        so the bot watches its stop/target itself.
+        Whole-share stock trades get a bracket order. Crypto and fractional shares can't
+        use brackets, so the bot watches their stop/target itself.
         """
-        if is_crypto(symbol):
-            body = {"symbol": symbol, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "gtc"}
+        if is_crypto(symbol) or fractional:
+            body = {"symbol": symbol, "qty": str(qty), "side": "buy", "type": "market",
+                    "time_in_force": "gtc" if is_crypto(symbol) else "day"}
             if client_order_id:
                 body["client_order_id"] = client_order_id
             return self._trade("POST", "/orders", json=body)

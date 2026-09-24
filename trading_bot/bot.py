@@ -18,7 +18,7 @@ from datetime import datetime, timedelta
 from .alpaca_client import AlpacaClient, AlpacaError, is_crypto, norm
 from .config import Config
 from .learner import Learner
-from .risk import daily_loss_hit, option_contracts, pick_option, position_size
+from .risk import account_limits, daily_loss_hit, option_contracts, pick_option, position_size
 from .strategy import LONG_STRATEGIES, STRATEGIES
 
 log = logging.getLogger("trading_bot")
@@ -53,7 +53,8 @@ class TradingBot:
         self.halted_day = None
         self.scanned = []
         self.scanned_at = None
-        self.shortable_cache = {}
+        self.asset_cache = {}
+        self.limits = None
 
     @property
     def open_trades(self):
@@ -78,22 +79,41 @@ class TradingBot:
         return list(dict.fromkeys(self.cfg.symbols + self.cfg.options_underlyings + self.cfg.world_symbols
                                   + self.scanned + held))
 
-    def _shortable(self, symbol):
-        if symbol not in self.shortable_cache:
+    def _asset(self, symbol):
+        if symbol not in self.asset_cache:
             try:
-                asset = self.client.get_asset(symbol)
-                self.shortable_cache[symbol] = bool(asset.get("shortable") and asset.get("easy_to_borrow"))
+                self.asset_cache[symbol] = self.client.get_asset(symbol)
             except AlpacaError:
-                return False
-        return self.shortable_cache[symbol]
+                return {}
+        return self.asset_cache[symbol]
+
+    def _shortable(self, symbol):
+        asset = self._asset(symbol)
+        return bool(asset.get("shortable") and asset.get("easy_to_borrow"))
+
+    def _set_limits(self, account):
+        limits = account_limits(float(account["equity"]), self.cfg)
+        if self.limits != limits:
+            log.info("Account $%.2f -> %s", float(account["equity"]), limits.describe())
+        self.limits = limits
 
     def _allowed(self, symbol):
-        """Which strategies a symbol may use: shorts need options (puts) or a borrowable stock."""
-        if is_crypto(symbol) or not self.cfg.allow_shorts:
+        """Which strategies a symbol may use: bearish bets need a big enough account and either
+        options (puts) or a borrowable stock; crypto is long-only."""
+        if is_crypto(symbol) or not self.limits.shorts:
             return list(LONG_STRATEGIES)
-        if symbol in self.cfg.options_underlyings or self._shortable(symbol):
+        if (symbol in self.cfg.options_underlyings and self.limits.options) or self._shortable(symbol):
             return list(STRATEGIES)
         return list(LONG_STRATEGIES)
+
+    def _day_trades_left(self, account, today):
+        """Below pdt_equity US rules allow only a few day trades per 5 days. Every stock or option
+        opened today will become a day trade when it closes, so count those as already spent."""
+        if not self.limits.pdt_limited:
+            return math.inf
+        opened_today = sum(1 for sym, t in self.open_trades.items()
+                           if not is_crypto(sym) and t.get("opened_at", "")[:10] == today.isoformat())
+        return self.cfg.pdt_max_day_trades - int(account.get("daytrade_count") or 0) - opened_today
 
     @staticmethod
     def _is_entry_order(order):
@@ -130,6 +150,7 @@ class TradingBot:
                  float(account["equity"]), float(account["last_equity"]),
                  f"open, {minutes_to_close:.0f} min to close" if stock_open else f"closed until {clock['next_open']}",
                  len(positions))
+        self._set_limits(account)
 
         today = now.date()
         if self.halted_day == today:
@@ -173,12 +194,12 @@ class TradingBot:
         for symbol, bars in fresh.items():
             try:
                 self._handle_symbol(symbol, bars, account, positions, pending,
-                                    allow_entries=is_crypto(symbol) or stock_entries)
+                                    allow_entries=is_crypto(symbol) or stock_entries, today=today)
             except AlpacaError as exc:
                 log.error("%s: %s", symbol, exc)
         self.learner.save()
 
-    def _handle_symbol(self, symbol, bars, account, positions, pending, allow_entries):
+    def _handle_symbol(self, symbol, bars, account, positions, pending, allow_entries, today=None):
         key = norm(symbol)
         choice, scores = self.learner.choose(symbol)
         previous = self.learner.state["active"].get(symbol)
@@ -211,21 +232,33 @@ class TradingBot:
         if not allow_entries:
             log.info("%s: too close to the close for new entries", symbol)
             return
-        if len(positions) + len(pending) >= self.cfg.max_open_positions:
+        if len(positions) + len(pending) >= self.limits.max_positions:
             log.info("%s: max open positions reached", symbol)
             return
+        crypto = is_crypto(symbol)
+        if not crypto and self._day_trades_left(account, today or _parse_ts(bars[-1]["t"]).date()) < 1:
+            log.info("%s: skipping, no day trades left this week (small-account rule)", symbol)
+            return
 
-        if symbol in self.cfg.options_underlyings:
+        if symbol in self.cfg.options_underlyings and self.limits.options:
             if self._enter_option(symbol, choice, signal, bars, account):
                 pending.add(key)
                 return
             if signal.side == "short" and not self._shortable(symbol):
                 return
 
-        crypto = is_crypto(symbol)
-        cash = account["non_marginable_buying_power"] if crypto else account["buying_power"]
-        qty = position_size(float(account["equity"]), float(cash), signal.price, signal.stop, self.cfg,
-                            fractional=crypto, side=signal.side)
+        equity = float(account["equity"])
+        cash = float(account["non_marginable_buying_power"] if crypto else account["buying_power"])
+        size = dict(side=signal.side, max_pct=self.limits.max_position_pct)
+        qty = position_size(equity, cash, signal.price, signal.stop, self.cfg, fractional=crypto, **size)
+        fractional = False
+        if not qty and not crypto and signal.side == "long" and self._asset(symbol).get("fractionable"):
+            # a whole share is too expensive for this account: buy a slice instead
+            qty = position_size(equity, cash, signal.price, signal.stop, self.cfg, fractional=True, **size)
+            fractional = bool(qty)
+        if crypto and qty and qty < float(self._asset(symbol).get("min_order_size") or 0):
+            log.info("%s: %s is below the coin's minimum order size", symbol, qty)
+            return
         if not qty:
             log.info("%s: position size too small", symbol)
             return
@@ -234,13 +267,14 @@ class TradingBot:
         self._act(
             f"{'BUY' if order_side == 'buy' else 'SHORT'} {qty} {symbol} @ ~{signal.price:.4g} "
             f"stop {signal.stop:.4g} target {signal.target:.4g} ({choice})",
-            lambda: self.client.submit_entry(symbol, qty, order_side, signal.target, signal.stop, order_id),
+            lambda: self.client.submit_entry(symbol, qty, order_side, signal.target, signal.stop, order_id,
+                                             fractional=fractional),
         )
         pending.add(key)
         if not self.dry_run:
             self.open_trades[symbol] = {"strategy": choice, "side": signal.side, "entry": signal.price,
                                         "stop": signal.stop, "target": signal.target, "opened_at": bars[-1]["t"],
-                                        "managed": crypto}
+                                        "managed": crypto or fractional}
 
     def _enter_option(self, symbol, choice, signal, bars, account):
         """Buy a call (bullish) or put (bearish). Returns False if no good contract was found."""
@@ -347,6 +381,7 @@ class TradingBot:
     def report(self):
         """Replay every strategy on current data and print what the bot would pick."""
         now = _parse_ts(self.client.get_clock()["timestamp"])
+        self._set_limits(self.client.get_account())
         symbols = self.stock_universe(now) + list(self.cfg.crypto_symbols)
         for symbol in symbols:
             self.learner.update(symbol, self._get_bars(symbol, now), self._allowed(symbol))

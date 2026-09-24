@@ -71,6 +71,9 @@ Then keep the computer **plugged in and switched on**. Closing a laptop lid usua
 the lid open. Logging out stops the bot until you log back in. Setting Windows or macOS to log in automatically
 makes it restart after a power cut too.
 
+**Getting updates:** double-click **`UPDATE.bat`** in the bot folder. It downloads the latest version, keeps your
+keys and everything the bot has learned, and restarts it.
+
 Check on it from your phone at any time in the Alpaca app or website. The log is in `bot.log` in the project folder.
 
 ⚠️ **Run only one copy of the bot at a time.** Two copies on the same Alpaca account would both place orders.
@@ -104,6 +107,16 @@ For each stock (every 5 minutes) and each coin (every hour), the bot:
    The log shows lines like `AMD: AI switched strategy trend -> breakout`.
 
 It doesn't trust a strategy because of a few lucky trades. A strategy needs a steady record before the bot uses it.
+
+**It adjusts itself to the size of your account.** It checks the balance every minute, so this works the same
+whether you start with $10 or $100,000:
+
+| Balance | What it does |
+|---|---|
+| under $100 | up to 2 positions, each up to half the account. Buys **slices of shares** ($1 minimum) when a whole share costs too much. |
+| $100 – $2,000 | up to 4 positions, each up to a quarter of the account |
+| $2,000 and up | normal mode: up to 8 positions, plus short selling and options |
+| under $25,000 | stays within the US **day-trading limit** (3 same-day round trips in 5 business days), so a sell is never blocked. Crypto isn't affected. Turn this off with `BOT_PDT=off` if the rule doesn't apply to your account. |
 
 **Safety limits:** every buy comes with a stop-loss and a take-profit. Each trade risks about 1% of the account.
 Options risk about 1% of the account each, counting a 50% drop as the full loss.

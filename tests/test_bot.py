@@ -5,7 +5,7 @@ from unittest import mock
 
 from trading_bot.bot import TradingBot, completed_bars
 from trading_bot.config import Config
-from trading_bot.risk import daily_loss_hit, option_contracts, pick_option, position_size
+from trading_bot.risk import account_limits, daily_loss_hit, option_contracts, pick_option, position_size
 import tempfile
 
 from trading_bot.learner import Learner, backtest
@@ -194,6 +194,15 @@ class ShortAndOptionTests(unittest.TestCase):
 
 
 class RiskTests(unittest.TestCase):
+    def test_account_limits_grow_with_balance(self):
+        c = cfg(options_underlyings=["SPY"])
+        tiny, small, mid, big = (account_limits(e, c) for e in (10, 500, 5_000, 30_000))
+        self.assertEqual((tiny.max_positions, tiny.max_position_pct), (2, 0.5))
+        self.assertEqual((small.max_positions, small.shorts, small.options), (4, False, False))
+        self.assertEqual((mid.max_positions, mid.shorts, mid.options, mid.pdt_limited), (8, True, True, True))
+        self.assertFalse(big.pdt_limited)
+        self.assertIn("tiny account", tiny.describe())
+
     def test_size_by_risk(self):
         # risk $1000 (1% of 100k), $2/share -> 500 shares, cap 20% = 200 shares at $100
         self.assertEqual(position_size(100_000, 1e9, 100, 98, cfg()), 200)
@@ -202,7 +211,7 @@ class RiskTests(unittest.TestCase):
     def test_fractional_crypto_size(self):
         qty = position_size(100_000, 1e9, 60_000, 59_000, cfg(), fractional=True)
         self.assertAlmostEqual(qty, 0.333333)
-        self.assertEqual(position_size(100_000, 5, 60_000, 59_000, cfg(), fractional=True), 0)  # < $10
+        self.assertEqual(position_size(100_000, 0.5, 60_000, 59_000, cfg(), fractional=True), 0)  # < $1
 
     def test_size_limited_by_cash(self):
         self.assertEqual(position_size(100_000, 500, 100, 90, cfg()), 5)
@@ -232,7 +241,7 @@ class ConfigTests(unittest.TestCase):
 
 class FakeClient:
     def __init__(self, bars, positions=(), minutes_to_close=120, equity="100000", last_equity="100000",
-                 is_open=True, actives=(), shortable=True, options=()):
+                 is_open=True, actives=(), shortable=True, options=(), daytrade_count=0, asset=None):
         self.bars = bars
         self.positions = list(positions)
         self.now = datetime.fromisoformat(bars[-1]["t"].replace("Z", "+00:00")) + timedelta(minutes=5)
@@ -244,6 +253,7 @@ class FakeClient:
         self.is_open, self.actives = is_open, list(actives)
         self.bar_requests = []
         self.shortable, self.options = shortable, list(options)
+        self.daytrade_count, self.asset = daytrade_count, asset or {}
         self.option_orders, self.canceled, self.exit_sides = [], [], []
 
     def get_clock(self):
@@ -251,8 +261,9 @@ class FakeClient:
                 "next_close": self.close.isoformat(), "next_open": ""}
 
     def get_account(self):
-        return {"equity": self.equity, "last_equity": self.last_equity, "buying_power": "200000",
-                "non_marginable_buying_power": "100000"}
+        return {"equity": self.equity, "last_equity": self.last_equity,
+                "buying_power": str(2 * float(self.equity)), "non_marginable_buying_power": self.equity,
+                "daytrade_count": self.daytrade_count}
 
     def get_most_active_stocks(self, top):
         return self.actives
@@ -272,7 +283,7 @@ class FakeClient:
         return self.sell_fill
 
     def get_asset(self, symbol):
-        return {"shortable": self.shortable, "easy_to_borrow": self.shortable}
+        return {"shortable": self.shortable, "easy_to_borrow": self.shortable, "fractionable": True, **self.asset}
 
     def get_option_candidates(self, underlying, kind, price, exp_from, exp_to):
         return [o for o in self.options if o["kind"] == kind]
@@ -288,8 +299,9 @@ class FakeClient:
         self.stops = getattr(self, "stops", []) + [(symbol, qty, stop_price)]
         return {"id": f"stop{len(self.stops)}"}
 
-    def submit_entry(self, symbol, qty, side, tp, sl, client_order_id=None):
+    def submit_entry(self, symbol, qty, side, tp, sl, client_order_id=None, fractional=False):
         self.orders.append((symbol, qty, tp, sl))
+        self.fractional_flags = getattr(self, "fractional_flags", []) + [fractional]
         self.sides = getattr(self, "sides", []) + [side]
         self.open_orders.append({"id": "e1", "symbol": symbol, "side": side, "client_order_id": client_order_id})
         self.order_ids = getattr(self, "order_ids", []) + [client_order_id]
@@ -508,6 +520,71 @@ class BotTests(unittest.TestCase):
                               {"id": "leg", "symbol": "MSFT", "side": "sell", "client_order_id": "uuid-ish"}]
         TradingBot(cfg(), learner=trend_learner(), client=client).run_once()
         self.assertEqual(client.canceled, ["abc"])
+
+    # --- account-size modes ---
+    def test_tiny_account_buys_a_slice_of_a_share(self):
+        client = FakeClient(make_bars(crossover_series()), equity="10", last_equity="10")
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        bot.run_once()
+        symbol, qty, tp, sl = client.orders[0]
+        self.assertEqual(client.fractional_flags, [True])
+        self.assertLess(qty, 1)
+        self.assertGreaterEqual(qty * 96, 1.0)          # at least Alpaca's $1 minimum
+        self.assertLessEqual(qty * 96, 10 * 0.5 + 1e-9)  # at most half of a tiny account
+        self.assertTrue(bot.open_trades["AAPL"]["managed"])  # no bracket, so the bot watches the stop
+
+    def test_big_account_still_uses_whole_shares(self):
+        client = FakeClient(make_bars(crossover_series()))
+        TradingBot(cfg(), learner=trend_learner(), client=client).run_once()
+        self.assertEqual(client.fractional_flags, [False])
+
+    def test_no_shorts_or_options_below_2000(self):
+        c = cfg(options_underlyings=["AAPL"])
+        client = FakeClient(make_bars(bearish_series()), equity="500", last_equity="500",
+                            options=[option("put", "AAPL261009P00100000", -0.5, 2.0, 2.1)])
+        bot = TradingBot(c, learner=trend_learner(c, short=True), client=client)
+        bot.run_once()
+        self.assertNotIn("trend_short", bot.learner.allowed["AAPL"])
+        self.assertEqual((client.orders, client.option_orders), ([], []))
+
+    def test_small_account_skips_calls_and_buys_shares(self):
+        c = cfg(options_underlyings=["AAPL"])
+        client = FakeClient(make_bars(crossover_series()), equity="500", last_equity="500",
+                            options=[option("call", "AAPL261009C00100000", 0.5, 2.0, 2.1)])
+        TradingBot(c, learner=trend_learner(c), client=client).run_once()
+        self.assertEqual(client.option_orders, [])
+        self.assertEqual(len(client.orders), 1)
+
+    def test_day_trade_limit_blocks_stock_entries(self):
+        client = FakeClient(make_bars(crossover_series()), equity="1000", last_equity="1000", daytrade_count=3)
+        TradingBot(cfg(), learner=trend_learner(), client=client).run_once()
+        self.assertEqual(client.orders, [])
+
+    def test_day_trades_reserved_for_trades_opened_today(self):
+        client = FakeClient(make_bars(crossover_series()), equity="1000", last_equity="1000", daytrade_count=2)
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        today = client.now.date().isoformat()
+        bot.open_trades["MSFT"] = {"strategy": "trend", "entry": 1, "stop": 0.5, "opened_at": today + "T14:00:00Z"}
+        client.positions = [{"symbol": "MSFT", "avg_entry_price": "1", "current_price": "1"}]
+        bot.run_once()
+        self.assertEqual(client.orders, [])  # 2 used + MSFT's exit later today = 3
+
+    def test_day_trade_limit_ignores_crypto_and_big_accounts(self):
+        c = cfg(crypto_symbols=["BTC/USD"])
+        client = FakeClient(make_bars(crossover_series()), is_open=False, equity="1000", last_equity="1000",
+                            daytrade_count=3)
+        TradingBot(c, learner=trend_learner(c), client=client).run_once()
+        self.assertEqual(len(client.orders), 1)
+        client = FakeClient(make_bars(crossover_series()), daytrade_count=3)
+        TradingBot(cfg(), learner=trend_learner(), client=client).run_once()
+        self.assertEqual(len(client.orders), 1)
+
+    def test_crypto_below_min_order_size_is_skipped(self):
+        c = cfg(crypto_symbols=["BTC/USD"])
+        client = FakeClient(make_bars(crossover_series()), is_open=False, equity="10", last_equity="10",
+                            asset={"min_order_size": "1"})
+        TradingBot(c, learner=trend_learner(c), client=client).run_once()
+        self.assertEqual(client.orders, [])
 
     def test_drops_forming_bar(self):
         bars = make_bars([1, 2, 3])

@@ -1,14 +1,51 @@
 """Position sizing and account-level safety checks."""
 import math
+from dataclasses import dataclass
 
 
-def position_size(equity, buying_power, entry, stop, cfg, fractional=False, side="long"):
+@dataclass
+class AccountLimits:
+    name: str
+    max_positions: int
+    max_position_pct: float
+    shorts: bool
+    options: bool
+    pdt_limited: bool
+
+    def describe(self):
+        extras = [f"up to {self.max_positions} positions of {self.max_position_pct:.0%} each",
+                  "shorts on" if self.shorts else "no shorts",
+                  "options on" if self.options else "no options"]
+        if self.pdt_limited:
+            extras.append("day-trade limit on")
+        return f"{self.name} mode: " + ", ".join(extras)
+
+
+def account_limits(equity, cfg):
+    """What the bot may do at this account size. Small accounts hold fewer, bigger positions;
+    shorting and options need margin_min_equity; below pdt_equity day trades are rationed."""
+    if equity < 100:
+        name, max_positions, pct = "tiny account", min(2, cfg.max_open_positions), 0.5
+    elif equity < cfg.margin_min_equity:
+        name, max_positions, pct = "small account", min(4, cfg.max_open_positions), 0.25
+    else:
+        name, max_positions, pct = "full", cfg.max_open_positions, cfg.max_position_pct
+    big_enough = equity >= cfg.margin_min_equity
+    return AccountLimits(
+        name=name, max_positions=max_positions, max_position_pct=pct,
+        shorts=cfg.allow_shorts and big_enough,
+        options=bool(cfg.options_underlyings) and big_enough,
+        pdt_limited=cfg.pdt_protection and equity < cfg.pdt_equity,
+    )
+
+
+def position_size(equity, buying_power, entry, stop, cfg, fractional=False, side="long", max_pct=None):
     """Shares (or coins) to trade so that hitting the stop loses ~risk_per_trade of equity."""
     risk_per_share = entry - stop if side == "long" else stop - entry
     if entry <= 0 or risk_per_share <= 0:
         return 0
     by_risk = (equity * cfg.risk_per_trade) / risk_per_share
-    by_cap = (equity * cfg.max_position_pct) / entry
+    by_cap = (equity * (max_pct or cfg.max_position_pct)) / entry
     by_cash = buying_power / entry
     qty = min(by_risk, by_cap, by_cash)
     if fractional:

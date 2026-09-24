@@ -61,7 +61,7 @@ class Config:
     crypto_timeframe: str = "1Hour"  # 5-minute crypto moves are too small to beat the fees
     crypto_learn_days: int = 30
     crypto_cost_pct: float = 0.005   # Alpaca crypto fees are ~0.25% per side
-    min_order_dollars: float = 10.0
+    min_order_dollars: float = 1.0   # Alpaca's minimum for fractional shares
     # Short selling: bet on falling prices (stocks Alpaca can borrow; never crypto)
     allow_shorts: bool = True
     # Options: on these liquid names, signals buy calls (bullish) or puts (bearish) instead of shares
@@ -109,6 +109,11 @@ class Config:
     max_position_pct: float = 0.20    # never put more than 20% of equity in one name
     max_open_positions: int = 8
     daily_loss_limit: float = 0.03    # stop trading after -3% on the day
+    # Account-size modes (see risk.account_limits); the bot switches automatically as the balance changes
+    margin_min_equity: float = 2000.0   # Alpaca needs $2,000 for shorting (and we require it for options)
+    pdt_protection: bool = True         # respect the US pattern-day-trader limit below pdt_equity
+    pdt_equity: float = 25000.0
+    pdt_max_day_trades: int = 3         # per rolling 5 business days
     no_new_entries_minutes: int = 30  # before close
     flatten_minutes: int = 10         # close everything this long before close
 
@@ -138,6 +143,8 @@ class Config:
             cfg.scan_stocks = False
         if os.getenv("BOT_OPTIONS", "").lower() in ("0", "off", "false", "no"):
             cfg.options_underlyings = []
+        if os.getenv("BOT_PDT", "").lower() in ("0", "off", "false", "no"):
+            cfg.pdt_protection = False
         if os.getenv("BOT_SHORTS", "").lower() in ("0", "off", "false", "no"):
             cfg.allow_shorts = False
         crypto = os.getenv("BOT_CRYPTO", "")
