@@ -8,6 +8,15 @@ class AlpacaError(RuntimeError):
     pass
 
 
+def is_crypto(symbol):
+    return "/" in symbol
+
+
+def norm(symbol):
+    """Alpaca reports crypto positions as BTCUSD but orders as BTC/USD; compare on this."""
+    return symbol.replace("/", "")
+
+
 class AlpacaClient:
     def __init__(self, config, session=None):
         self.cfg = config
@@ -42,7 +51,13 @@ class AlpacaClient:
         return self._trade("GET", "/orders", params={"status": "open", "limit": 500})
 
     # --- orders ---
-    def submit_bracket_buy(self, symbol, qty, take_profit, stop_loss, client_order_id=None):
+    def submit_buy(self, symbol, qty, take_profit, stop_loss, client_order_id=None):
+        """Stocks get a bracket order. Crypto can't use brackets, so the bot watches its stop/target itself."""
+        if is_crypto(symbol):
+            body = {"symbol": symbol, "qty": str(qty), "side": "buy", "type": "market", "time_in_force": "gtc"}
+            if client_order_id:
+                body["client_order_id"] = client_order_id
+            return self._trade("POST", "/orders", json=body)
         body = {
             "symbol": symbol,
             "qty": str(qty),
@@ -73,27 +88,41 @@ class AlpacaClient:
     def close_position(self, symbol):
         # Cancel the bracket legs first, otherwise the shares are held by them.
         for order in self.get_open_orders() or []:
-            if order["symbol"] == symbol:
+            if norm(order["symbol"]) == norm(symbol):
                 self._trade("DELETE", f"/orders/{order['id']}")
-        return self._trade("DELETE", f"/positions/{symbol}")
+        return self._trade("DELETE", f"/positions/{norm(symbol)}")
 
     def close_all_positions(self):
         return self._trade("DELETE", "/positions", params={"cancel_orders": "true"})
 
     # --- market data ---
+    def get_most_active_stocks(self, top):
+        """Most-traded stocks today with price and IEX dollar volume: [(symbol, price, dollar_volume)]."""
+        data_root = self.cfg.data_url.rsplit("/", 1)[0]
+        actives = self._request("GET", f"{data_root}/v1beta1/screener/stocks/most-actives",
+                                params={"by": "trades", "top": top})["most_actives"]
+        symbols = [a["symbol"] for a in actives]
+        snaps = self._request("GET", f"{self.cfg.data_url}/stocks/snapshots",
+                              params={"symbols": ",".join(symbols), "feed": self.cfg.data_feed}) or {}
+        out = []
+        for sym in symbols:
+            snap = snaps.get(sym) or {}
+            bar = snap.get("dailyBar") or snap.get("prevDailyBar") or {}
+            if bar:
+                out.append((sym, bar["c"], bar["c"] * bar["v"]))
+        return out
+
     def get_bars(self, symbol, timeframe, lookback_days=5):
         start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
-        params = {
-            "symbols": symbol,
-            "timeframe": timeframe,
-            "start": start,
-            "limit": 10000,
-            "feed": self.cfg.data_feed,
-            "adjustment": "raw",
-        }
+        params = {"symbols": symbol, "timeframe": timeframe, "start": start, "limit": 10000}
+        if is_crypto(symbol):
+            url = f"{self.cfg.data_url.rsplit('/', 1)[0]}/v1beta3/crypto/us/bars"
+        else:
+            url = f"{self.cfg.data_url}/stocks/bars"
+            params.update(feed=self.cfg.data_feed, adjustment="raw")
         bars = []
         while True:
-            data = self._request("GET", f"{self.cfg.data_url}/stocks/bars", params=params)
+            data = self._request("GET", url, params=params)
             bars.extend((data.get("bars") or {}).get(symbol, []))
             token = data.get("next_page_token")
             if not token:

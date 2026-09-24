@@ -7,9 +7,10 @@ How it learns:
   2. Experience. Every real trade the bot closes is saved to the state file with
      its R. Real trades count `live_weight` times as much as replayed ones.
   3. Pick. A strategy's score is its average R per trade. It is pulled toward
-     that strategy's average on the other symbols until the symbol has enough
-     trades of its own (`prior_strength`), so a few lucky trades don't win. Each symbol uses its highest-scoring
-     strategy, or sits out when nothing scores above `min_score`.
+     that strategy's average on the other symbols (stocks and crypto learn
+     separately) until the symbol has enough trades of its own
+     (`prior_strength`), so a few lucky trades don't win. Each symbol uses its
+     highest-scoring strategy, or sits out when nothing scores above `min_score`.
 """
 import json
 import os
@@ -24,17 +25,18 @@ def _day(bar):
     return bar["t"][:10]
 
 
-def backtest(strategy, bars, cfg):
+def backtest(strategy, bars, cfg, eod_exit=True, cost_pct=None):
     """Replay `strategy` over `bars` and return the R-multiple of each closed trade.
 
     Entries fill at the signal bar's close. A stop or target is checked from the
     next bar. If both are touched in one bar the stop is assumed (pessimistic).
-    Positions are closed at the last bar of each day, like the live bot.
+    With eod_exit (stocks) positions are closed at the last bar of each day, like the live bot.
     """
+    cost_pct = cfg.cost_pct if cost_pct is None else cost_pct
     results, pos = [], None
     for i in range(WARMUP_BARS, len(bars)):
         bar = bars[i]
-        last_of_day = i + 1 < len(bars) and _day(bars[i + 1]) != _day(bar)
+        last_of_day = eod_exit and i + 1 < len(bars) and _day(bars[i + 1]) != _day(bar)
 
         if pos:
             exit_price = None
@@ -45,7 +47,7 @@ def backtest(strategy, bars, cfg):
             elif last_of_day or strategy(bars[max(0, i - WINDOW):i + 1], cfg).action == "sell":
                 exit_price = bar["c"]
             if exit_price is not None:
-                cost = pos["entry"] * cfg.cost_pct
+                cost = pos["entry"] * cost_pct
                 results.append((exit_price - pos["entry"] - cost) / pos["risk"])
                 pos = None
             continue
@@ -99,15 +101,22 @@ class Learner:
 
     def score(self, strategy, symbol):
         k = self.cfg.prior_strength
-        others = (set(self.replay) | set(self.state["live_results"].get(strategy, {}))) - {symbol}
+        group = self._group(symbol)
+        others = {s for s in set(self.replay) | set(self.state["live_results"].get(strategy, {}))
+                  if s != symbol and self._group(s) == group}
         o_total, o_n = self._totals(strategy, others)
         others_mean = o_total / (o_n + k)  # shrunk toward 0 when there's little data anywhere
         s_total, s_n = self._totals(strategy, [symbol])
         return (s_total + k * others_mean) / (s_n + k)
 
+    def _group(self, symbol):
+        return "crypto" if "/" in symbol else "stock"
+
     def update(self, symbol, bars):
         """Replay all strategies on the latest bars for `symbol`."""
-        self.replay[symbol] = {name: self.backtester(fn, bars, self.cfg)
+        crypto = self._group(symbol) == "crypto"
+        kwargs = {"eod_exit": not crypto, "cost_pct": self.cfg.crypto_cost_pct if crypto else self.cfg.cost_pct}
+        self.replay[symbol] = {name: self.backtester(fn, bars, self.cfg, **kwargs)
                                for name, fn in self.strategies.items()}
 
     def choose(self, symbol):

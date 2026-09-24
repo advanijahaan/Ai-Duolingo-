@@ -28,6 +28,9 @@ STATE_DIR = tempfile.mkdtemp()
 def cfg(**kw):
     c = Config(api_key="k", api_secret="s")
     c.symbols = ["AAPL"]
+    c.scan_stocks = False
+    c.crypto_symbols = []
+    c.crypto_timeframe = "5Min"
     c.state_file = os.path.join(STATE_DIR, f"state-{id(c)}.json")
     for k, v in kw.items():
         setattr(c, k, v)
@@ -141,7 +144,7 @@ class BacktestTests(unittest.TestCase):
 class LearnerTests(unittest.TestCase):
     def test_picks_best_and_shrinks_small_samples(self):
         results = {"trend": [0.5] * 20, "mean_reversion": [3.0], "breakout": [-1.0] * 5}
-        learner = Learner(cfg(), backtester=lambda fn, bars, c: results[fn.__name__])
+        learner = Learner(cfg(), backtester=lambda fn, bars, c, **kw: results[fn.__name__])
         learner.update("AAPL", [])
         choice, scores = learner.choose("AAPL")
         self.assertEqual(choice, "trend")  # one lucky 3R trade shouldn't beat a steady record
@@ -149,7 +152,7 @@ class LearnerTests(unittest.TestCase):
 
     def test_live_results_persist_and_change_choice(self):
         c = cfg()
-        learner = Learner(c, backtester=lambda fn, bars, c: [0.2] * 10 if fn is trend else [0.1] * 10)
+        learner = Learner(c, backtester=lambda fn, bars, c, **kw: [0.2] * 10 if fn is trend else [0.1] * 10)
         learner.update("AAPL", [])
         self.assertEqual(learner.choose("AAPL")[0], "trend")
         for _ in range(10):
@@ -164,6 +167,11 @@ class RiskTests(unittest.TestCase):
         # risk $1000 (1% of 100k), $2/share -> 500 shares, cap 20% = 200 shares at $100
         self.assertEqual(position_size(100_000, 1e9, 100, 98, cfg()), 200)
         self.assertEqual(position_size(100_000, 1e9, 100, 90, cfg()), 100)
+
+    def test_fractional_crypto_size(self):
+        qty = position_size(100_000, 1e9, 60_000, 59_000, cfg(), fractional=True)
+        self.assertAlmostEqual(qty, 0.333333)
+        self.assertEqual(position_size(100_000, 5, 60_000, 59_000, cfg(), fractional=True), 0)  # < $10
 
     def test_size_limited_by_cash(self):
         self.assertEqual(position_size(100_000, 500, 100, 90, cfg()), 5)
@@ -192,7 +200,8 @@ class ConfigTests(unittest.TestCase):
 
 
 class FakeClient:
-    def __init__(self, bars, positions=(), minutes_to_close=120, equity="100000", last_equity="100000"):
+    def __init__(self, bars, positions=(), minutes_to_close=120, equity="100000", last_equity="100000",
+                 is_open=True, actives=()):
         self.bars = bars
         self.positions = list(positions)
         self.now = datetime.fromisoformat(bars[-1]["t"].replace("Z", "+00:00")) + timedelta(minutes=5)
@@ -201,13 +210,19 @@ class FakeClient:
         self.orders, self.closed, self.closed_all = [], [], 0
         self.sell_fill = None
         self.open_orders = []
+        self.is_open, self.actives = is_open, list(actives)
+        self.bar_requests = []
 
     def get_clock(self):
-        return {"is_open": True, "timestamp": self.now.isoformat(),
+        return {"is_open": self.is_open, "timestamp": self.now.isoformat(),
                 "next_close": self.close.isoformat(), "next_open": ""}
 
     def get_account(self):
-        return {"equity": self.equity, "last_equity": self.last_equity, "buying_power": "200000"}
+        return {"equity": self.equity, "last_equity": self.last_equity, "buying_power": "200000",
+                "non_marginable_buying_power": "100000"}
+
+    def get_most_active_stocks(self, top):
+        return self.actives
 
     def get_positions(self):
         return self.positions
@@ -216,18 +231,20 @@ class FakeClient:
         return self.open_orders
 
     def get_bars(self, symbol, timeframe, lookback_days=5):
+        self.bar_requests.append(symbol)
         return self.bars
 
     def get_last_sell_fill(self, symbol, after):
         return self.sell_fill
 
-    def submit_bracket_buy(self, symbol, qty, tp, sl, client_order_id=None):
+    def submit_buy(self, symbol, qty, tp, sl, client_order_id=None):
         self.orders.append((symbol, qty, tp, sl))
         self.open_orders.append({"symbol": symbol, "side": "buy"})
         self.order_ids = getattr(self, "order_ids", []) + [client_order_id]
 
     def close_position(self, symbol):
         self.closed.append(symbol)
+        self.positions = [p for p in self.positions if p["symbol"] != symbol.replace("/", "")]
 
     def close_all_positions(self):
         self.closed_all += 1
@@ -235,7 +252,7 @@ class FakeClient:
 
 def trend_learner(c=None):
     """Learner whose replay always says trend wins, so bot tests are deterministic."""
-    def fake_backtest(fn, bars, c):
+    def fake_backtest(fn, bars, c, **kw):
         return [1.0] * 10 if fn is trend else [-1.0] * 10
     return Learner(c or cfg(), backtester=fake_backtest)
 
@@ -245,6 +262,7 @@ class BotTests(unittest.TestCase):
         client = FakeClient(make_bars(crossover_series()))
         bot = TradingBot(cfg(), learner=trend_learner(), client=client)
         bot.run_once()
+        bot.last_bar_seen.clear()  # force a re-fetch of the same bar
         bot.run_once()  # same bar again: must not double-buy
         self.assertEqual(len(client.orders), 1)
         symbol, qty, tp, sl = client.orders[0]
@@ -265,7 +283,7 @@ class BotTests(unittest.TestCase):
 
     def test_sits_out_when_nothing_works(self):
         c = cfg()
-        learner = Learner(c, backtester=lambda fn, bars, c: [-1.0] * 10)
+        learner = Learner(c, backtester=lambda fn, bars, c, **kw: [-1.0] * 10)
         client = FakeClient(make_bars(crossover_series()))
         TradingBot(c, learner=learner, client=client).run_once()
         self.assertEqual(client.orders, [])
@@ -282,16 +300,55 @@ class BotTests(unittest.TestCase):
         self.assertEqual(client.orders, [])
 
     def test_flattens_at_end_of_day(self):
-        client = FakeClient(make_bars(crossover_series()), positions=[{"symbol": "AAPL"}], minutes_to_close=5)
+        client = FakeClient(make_bars(crossover_series()), positions=[{"symbol": "AAPL", "asset_class": "us_equity", "avg_entry_price": "100"},
+                                       {"symbol": "BTCUSD", "asset_class": "crypto", "avg_entry_price": "100"}],
+                            minutes_to_close=5)
         TradingBot(cfg(), learner=trend_learner(), client=client).run_once()
-        self.assertEqual(client.closed_all, 1)
+        self.assertEqual(client.closed, ["AAPL"])  # crypto keeps trading overnight
 
     def test_daily_loss_halts(self):
-        client = FakeClient(make_bars(crossover_series()), positions=[{"symbol": "AAPL"}],
+        client = FakeClient(make_bars(crossover_series()), positions=[{"symbol": "AAPL", "avg_entry_price": "100"}],
                             equity="95000", last_equity="100000")
         TradingBot(cfg(), learner=trend_learner(), client=client).run_once()
         self.assertEqual(client.closed_all, 1)
         self.assertEqual(client.orders, [])
+
+    def test_crypto_trades_when_stock_market_closed(self):
+        c = cfg(crypto_symbols=["BTC/USD"])
+        client = FakeClient(make_bars(crossover_series()), is_open=False)
+        bot = TradingBot(c, learner=trend_learner(c), client=client)
+        bot.run_once()
+        self.assertEqual(client.bar_requests, ["BTC/USD"])  # stocks skipped while closed
+        self.assertEqual(len(client.orders), 1)
+        symbol, qty, tp, sl = client.orders[0]
+        self.assertEqual(symbol, "BTC/USD")
+        self.assertNotEqual(qty, int(qty))  # fractional coins
+        self.assertIn("target", bot.open_trades["BTC/USD"])
+
+    def test_crypto_stop_loss_enforced_by_bot(self):
+        c = cfg(crypto_symbols=["BTC/USD"])
+        client = FakeClient(make_bars(crossover_series()), is_open=False,
+                            positions=[{"symbol": "BTCUSD", "asset_class": "crypto",
+                                        "avg_entry_price": "100", "current_price": "97"}])
+        bot = TradingBot(c, learner=trend_learner(c), client=client)
+        bot.open_trades["BTC/USD"] = {"strategy": "trend", "entry": 100.0, "stop": 98.0, "target": 104.0,
+                                      "opened_at": "x"}
+        bot.run_once()
+        self.assertEqual(client.closed, ["BTC/USD"])
+
+    def test_stock_scan_filters_penny_and_thin_stocks(self):
+        c = cfg(scan_stocks=True)
+        client = FakeClient(make_bars(crossover_series()),
+                            actives=[("NVDA", 225.0, 5e8), ("PENNY", 0.5, 5e8), ("THIN", 50.0, 1e5)])
+        bot = TradingBot(c, learner=trend_learner(c), client=client)
+        self.assertEqual(bot.stock_universe(client.now), ["AAPL", "NVDA"])
+
+    def test_only_fetches_when_new_bar_due(self):
+        client = FakeClient(make_bars(crossover_series()))
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        bot.run_once()
+        bot.run_once()
+        self.assertEqual(client.bar_requests, ["AAPL"])
 
     def test_drops_forming_bar(self):
         bars = make_bars([1, 2, 3])

@@ -38,7 +38,22 @@ class Config:
     data_url: str = DATA_BASE_URL
     data_feed: str = "iex"  # free accounts only get the IEX feed
 
-    symbols: list = field(default_factory=lambda: ["SPY", "QQQ", "AAPL", "MSFT", "NVDA", "AMD", "TSLA", "META"])
+    # Stocks: these are always watched, plus the most-traded stocks of the day (scan)
+    symbols: list = field(default_factory=lambda: ["SPY", "QQQ"])
+    scan_stocks: bool = True
+    scan_top: int = 50               # how many most-active stocks to look at
+    max_scanned: int = 40            # how many of them to trade after filtering
+    min_price: float = 10.0          # skip penny stocks
+    min_dollar_volume: float = 20e6  # skip thinly traded stocks
+    rescan_minutes: int = 30
+    # Crypto trades 24/7
+    crypto_symbols: list = field(default_factory=lambda: [
+        "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD",
+        "LTC/USD", "AVAX/USD", "LINK/USD", "ADA/USD", "DOT/USD"])
+    crypto_timeframe: str = "1Hour"  # 5-minute crypto moves are too small to beat the fees
+    crypto_learn_days: int = 30
+    crypto_cost_pct: float = 0.005   # Alpaca crypto fees are ~0.25% per side
+    min_order_dollars: float = 10.0
     timeframe: str = "5Min"
     poll_seconds: int = 60
 
@@ -73,7 +88,7 @@ class Config:
     # Risk
     risk_per_trade: float = 0.01      # risk 1% of equity per trade
     max_position_pct: float = 0.20    # never put more than 20% of equity in one name
-    max_open_positions: int = 5
+    max_open_positions: int = 8
     daily_loss_limit: float = 0.03    # stop trading after -3% on the day
     no_new_entries_minutes: int = 30  # before close
     flatten_minutes: int = 10         # close everything this long before close
@@ -98,5 +113,12 @@ class Config:
             )
         cfg = cls(api_key=key, api_secret=secret, base_url=base_url)
         cfg.symbols = _env_list("BOT_SYMBOLS", cfg.symbols)
+        if os.getenv("BOT_SCAN_STOCKS", "").lower() in ("0", "off", "false", "no"):
+            cfg.scan_stocks = False
+        crypto = os.getenv("BOT_CRYPTO", "")
+        if crypto.lower() in ("0", "off", "false", "no"):
+            cfg.crypto_symbols = []
+        elif crypto:
+            cfg.crypto_symbols = _env_list("BOT_CRYPTO", cfg.crypto_symbols)
         cfg.data_feed = os.getenv("ALPACA_DATA_FEED", cfg.data_feed)
         return cfg
