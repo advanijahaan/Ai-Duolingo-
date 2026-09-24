@@ -29,6 +29,7 @@ def cfg(**kw):
     c = Config(api_key="k", api_secret="s")
     c.symbols = ["AAPL"]
     c.scan_stocks = False
+    c.world_symbols = []
     c.crypto_symbols = []
     c.crypto_timeframe = "5Min"
     c.state_file = os.path.join(STATE_DIR, f"state-{id(c)}.json")
@@ -336,12 +337,12 @@ class BotTests(unittest.TestCase):
         bot.run_once()
         self.assertEqual(client.closed, ["BTC/USD"])
 
-    def test_stock_scan_filters_penny_and_thin_stocks(self):
-        c = cfg(scan_stocks=True)
+    def test_universe_has_world_and_filtered_scan(self):
+        c = cfg(scan_stocks=True, world_symbols=["EWJ"])
         client = FakeClient(make_bars(crossover_series()),
                             actives=[("NVDA", 225.0, 5e8), ("PENNY", 0.5, 5e8), ("THIN", 50.0, 1e5)])
         bot = TradingBot(c, learner=trend_learner(c), client=client)
-        self.assertEqual(bot.stock_universe(client.now), ["AAPL", "NVDA"])
+        self.assertEqual(bot.stock_universe(client.now), ["AAPL", "EWJ", "NVDA"])
 
     def test_only_fetches_when_new_bar_due(self):
         client = FakeClient(make_bars(crossover_series()))

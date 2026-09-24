@@ -9,6 +9,11 @@ strategy works for each one and switches on its own.
 **What it trades:**
 - **Stocks:** SPY and QQQ, plus up to 40 of the day's most-traded US stocks and ETFs. It rescans every 30 minutes and
   skips anything under $10 or thinly traded. Trading hours: Monday to Friday, 9:30 AM to 4:00 PM Eastern.
+- **World markets:** Alpaca can only trade on US exchanges, so the bot reaches other countries through funds and
+  companies listed in the US. It trades these during US market hours:
+  - Countries and regions: Europe, Japan, China, India, Brazil, UK, Canada, Korea, Taiwan, emerging markets.
+  - Big foreign companies: TSMC, ASML, Alibaba, Novo Nordisk, SAP, Shell, BP, Shopify, MercadoLibre and more.
+  - Gold, silver, oil, natural gas and US Treasury bonds.
 - **Crypto:** BTC, ETH, SOL, XRP, DOGE, LTC, AVAX, LINK, ADA and DOT. It trades **24/7**, including nights and weekends.
 
 ### How to see what it's making (phone or computer)
@@ -72,6 +77,7 @@ Settings live in `trading_bot/config.py`. For example, lowering `min_score` make
 that a strategy works. You can also add these lines to `.env`:
 - `BOT_SYMBOLS=SPY,AAPL`: stocks to always watch
 - `BOT_SCAN_STOCKS=off`: stop adding the most-traded stocks
+- `BOT_WORLD=off`: no world markets
 - `BOT_CRYPTO=BTC/USD,ETH/USD`: choose your own coins
 - `BOT_CRYPTO=off`: no crypto
 

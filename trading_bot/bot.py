@@ -1,4 +1,4 @@
-"""Self-learning paper-trading bot for Alpaca: US stocks during market hours, crypto 24/7.
+"""Self-learning paper-trading bot for Alpaca: US and world-market stocks/ETFs during US hours, crypto 24/7.
 
 Run:  python -m trading_bot.bot            # trade in a loop
       python -m trading_bot.bot --once     # single pass, then exit
@@ -69,7 +69,7 @@ class TradingBot:
             except AlpacaError as exc:
                 log.error("Stock scan failed, keeping previous list: %s", exc)
         held = [s for s in self.open_trades if not is_crypto(s)]
-        return list(dict.fromkeys(self.cfg.symbols + self.scanned + held))
+        return list(dict.fromkeys(self.cfg.symbols + self.cfg.world_symbols + self.scanned + held))
 
     def _timeframe(self, symbol):
         return self.cfg.crypto_timeframe if is_crypto(symbol) else self.cfg.timeframe
@@ -265,8 +265,9 @@ class TradingBot:
         print(f"Trading {len(using)} of {len(symbols)}: {', '.join(using) or 'none right now'}")
 
     def run_forever(self):
-        log.info("Trading %d stocks%s + %d crypto on %s (%s)", len(self.cfg.symbols),
-                 " + daily most-traded scan" if self.cfg.scan_stocks else "", len(self.cfg.crypto_symbols),
+        log.info("Trading %d stocks + %d world%s + %d crypto on %s (%s)", len(self.cfg.symbols),
+                 len(self.cfg.world_symbols), " + daily most-traded scan" if self.cfg.scan_stocks else "",
+                 len(self.cfg.crypto_symbols),
                  self.cfg.base_url, "DRY RUN" if self.dry_run else "paper orders")
         while True:
             try:

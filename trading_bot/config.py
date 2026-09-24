@@ -40,6 +40,14 @@ class Config:
 
     # Stocks: these are always watched, plus the most-traded stocks of the day (scan)
     symbols: list = field(default_factory=lambda: ["SPY", "QQQ"])
+    # World markets through US-listed funds and foreign companies (Alpaca can't reach foreign exchanges)
+    world_symbols: list = field(default_factory=lambda: [
+        # country / region ETFs
+        "EFA", "EEM", "VGK", "EWJ", "FXI", "KWEB", "MCHI", "INDA", "EWZ", "EWU", "EWC", "EWY", "EWT",
+        # big foreign companies listed in the US
+        "TSM", "ASML", "BABA", "PDD", "NVO", "SAP", "SHEL", "BP", "SHOP", "MELI", "NU",
+        # commodities and bonds
+        "GLD", "SLV", "USO", "UNG", "TLT"])
     scan_stocks: bool = True
     scan_top: int = 50               # how many most-active stocks to look at
     max_scanned: int = 40            # how many of them to trade after filtering
@@ -113,6 +121,8 @@ class Config:
             )
         cfg = cls(api_key=key, api_secret=secret, base_url=base_url)
         cfg.symbols = _env_list("BOT_SYMBOLS", cfg.symbols)
+        if os.getenv("BOT_WORLD", "").lower() in ("0", "off", "false", "no"):
+            cfg.world_symbols = []
         if os.getenv("BOT_SCAN_STOCKS", "").lower() in ("0", "off", "false", "no"):
             cfg.scan_stocks = False
         crypto = os.getenv("BOT_CRYPTO", "")
