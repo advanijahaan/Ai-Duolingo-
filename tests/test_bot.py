@@ -403,7 +403,8 @@ class BotTests(unittest.TestCase):
         client = FakeClient(make_bars(crossover_series()), positions=[{"symbol": "AAPL", "asset_class": "us_equity", "avg_entry_price": "100"},
                                        {"symbol": "BTCUSD", "asset_class": "crypto", "avg_entry_price": "100"}],
                             minutes_to_close=5)
-        TradingBot(cfg(), learner=trend_learner(), client=client).run_once()
+        c = cfg(crypto_symbols=["BTC/USD"])
+        TradingBot(c, learner=trend_learner(c), client=client).run_once()
         self.assertEqual(client.closed, ["AAPL"])  # crypto keeps trading overnight
 
     def test_daily_loss_halts(self):
