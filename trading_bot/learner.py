@@ -69,6 +69,7 @@ class Learner:
         self.state = self._load()
         self.replay = {}   # symbol -> {strategy: [R, ...]} from the latest replay
         self.allowed = {}  # symbol -> strategy names it may use (e.g. no shorts for crypto)
+        self._group_cache = {}  # (strategy, group) -> totals over every symbol; cleared when data changes
 
     # --- persistence ---
     def _load(self):
@@ -88,6 +89,7 @@ class Learner:
     def record_trade(self, symbol, strategy, r_multiple):
         by_symbol = self.state["live_results"].setdefault(strategy, {})
         by_symbol.setdefault(symbol, []).append(round(r_multiple, 4))
+        self._group_cache.clear()
         self.save()
 
     def _totals(self, strategy, symbols):
@@ -103,11 +105,14 @@ class Learner:
     def score(self, strategy, symbol):
         k = self.cfg.prior_strength
         group = self._group(symbol)
-        others = {s for s in set(self.replay) | set(self.state["live_results"].get(strategy, {}))
-                  if s != symbol and self._group(s) == group}
-        o_total, o_n = self._totals(strategy, others)
-        others_mean = o_total / (o_n + k)  # shrunk toward 0 when there's little data anywhere
+        if (strategy, group) not in self._group_cache:
+            members = {s for s in set(self.replay) | set(self.state["live_results"].get(strategy, {}))
+                       if self._group(s) == group}
+            self._group_cache[(strategy, group)] = self._totals(strategy, members)
+        g_total, g_n = self._group_cache[(strategy, group)]
         s_total, s_n = self._totals(strategy, [symbol])
+        o_total, o_n = g_total - s_total, g_n - s_n  # everyone else in the group
+        others_mean = o_total / (o_n + k)  # shrunk toward 0 when there's little data anywhere
         return (s_total + k * others_mean) / (s_n + k)
 
     def _group(self, symbol):
@@ -122,6 +127,7 @@ class Learner:
         kwargs = {"eod_exit": not crypto, "cost_pct": self.cfg.crypto_cost_pct if crypto else self.cfg.cost_pct}
         names = [n for n in self.strategies if allowed is None or n in allowed]
         self.allowed[symbol] = names
+        self._group_cache.clear()
         flipped = mirror(bars) if bars and any(hasattr(self.strategies[n], "base") for n in names) else bars
         self.replay[symbol] = {}
         for name in names:

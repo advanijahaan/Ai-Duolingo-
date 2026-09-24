@@ -1,7 +1,9 @@
 """Thin REST wrapper around the Alpaca trading and market-data APIs."""
 from datetime import datetime, timedelta, timezone
 
+import time
 import uuid
+from collections import deque
 from urllib.parse import quote
 
 import requests
@@ -20,17 +22,31 @@ def norm(symbol):
     return symbol.replace("/", "")
 
 
+STOCK_EXCHANGES = {"NYSE", "NASDAQ", "ARCA", "AMEX", "BATS"}
+MAX_REQUESTS_PER_MINUTE = 180  # Alpaca's free plan allows 200
+
+
 class AlpacaClient:
     def __init__(self, config, session=None):
         self.cfg = config
+        self._recent = deque()
         self.session = session or requests.Session()
         self.session.headers.update({
             "APCA-API-KEY-ID": config.api_key,
             "APCA-API-SECRET-KEY": config.api_secret,
         })
 
+    def _throttle(self):
+        now = time.monotonic()
+        while self._recent and now - self._recent[0] > 60:
+            self._recent.popleft()
+        if len(self._recent) >= MAX_REQUESTS_PER_MINUTE:
+            time.sleep(60 - (now - self._recent[0]) + 0.1)
+        self._recent.append(time.monotonic())
+
     def _request(self, method, url, **kwargs):
-        resp = self.session.request(method, url, timeout=15, **kwargs)
+        self._throttle()
+        resp = self.session.request(method, url, timeout=30, **kwargs)
         if resp.status_code >= 400:
             raise AlpacaError(f"{method} {url} -> {resp.status_code}: {resp.text}")
         if resp.status_code == 204 or not resp.content:
@@ -164,6 +180,41 @@ class AlpacaClient:
             bar = snap.get("dailyBar") or snap.get("prevDailyBar") or {}
             if bar:
                 out.append((sym, bar["c"], bar["c"] * bar["v"]))
+        return out
+
+    def get_tradable_stocks(self):
+        """Every active, tradable US-listed stock and ETF on a major exchange."""
+        assets = self._trade("GET", "/assets", params={"status": "active", "asset_class": "us_equity"}) or []
+        return [a["symbol"] for a in assets
+                if a.get("tradable") and a.get("exchange") in STOCK_EXCHANGES and a["symbol"].isalpha()]
+
+    def get_daily_stats(self, symbols, batch=200):
+        """{symbol: (price, dollar_volume)} from the latest daily bar, fetched in batches."""
+        out = {}
+        for i in range(0, len(symbols), batch):
+            snaps = self._request("GET", f"{self.cfg.data_url}/stocks/snapshots", params={
+                "symbols": ",".join(symbols[i:i + batch]), "feed": self.cfg.data_feed}) or {}
+            for sym, snap in snaps.items():
+                bar = (snap or {}).get("dailyBar") or (snap or {}).get("prevDailyBar") or {}
+                if bar.get("c"):
+                    out[sym] = (bar["c"], bar["c"] * bar.get("v", 0))
+        return out
+
+    def get_stock_bars(self, symbols, timeframe, lookback_days=5, batch=50):
+        """{symbol: bars} for many stocks, a few requests per batch instead of one per stock."""
+        start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
+        out = {s: [] for s in symbols}
+        for i in range(0, len(symbols), batch):
+            params = {"symbols": ",".join(symbols[i:i + batch]), "timeframe": timeframe, "start": start,
+                      "limit": 10000, "feed": self.cfg.data_feed, "adjustment": "raw"}
+            while True:
+                data = self._request("GET", f"{self.cfg.data_url}/stocks/bars", params=params)
+                for sym, bars in (data.get("bars") or {}).items():
+                    out.setdefault(sym, []).extend(
+                        {"t": b["t"], "o": b["o"], "h": b["h"], "l": b["l"], "c": b["c"], "v": b["v"]} for b in bars)
+                if not data.get("next_page_token"):
+                    break
+                params["page_token"] = data["next_page_token"]
         return out
 
     def get_bars(self, symbol, timeframe, lookback_days=5):

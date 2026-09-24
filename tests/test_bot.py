@@ -29,6 +29,7 @@ def cfg(**kw):
     c = Config(api_key="k", api_secret="s")
     c.symbols = ["AAPL"]
     c.scan_stocks = False
+    c.universe_size = 0
     c.world_symbols = []
     c.options_underlyings = []
     c.crypto_symbols = []
@@ -241,7 +242,8 @@ class ConfigTests(unittest.TestCase):
 
 class FakeClient:
     def __init__(self, bars, positions=(), minutes_to_close=120, equity="100000", last_equity="100000",
-                 is_open=True, actives=(), shortable=True, options=(), daytrade_count=0, asset=None):
+                 is_open=True, actives=(), shortable=True, options=(), daytrade_count=0, asset=None,
+                 bars_by_symbol=None, tradable=(), daily_stats=None):
         self.bars = bars
         self.positions = list(positions)
         self.now = datetime.fromisoformat(bars[-1]["t"].replace("Z", "+00:00")) + timedelta(minutes=5)
@@ -254,6 +256,9 @@ class FakeClient:
         self.bar_requests = []
         self.shortable, self.options = shortable, list(options)
         self.daytrade_count, self.asset = daytrade_count, asset or {}
+        self.bars_by_symbol = bars_by_symbol or {}
+        self.tradable, self.daily_stats = list(tradable), daily_stats or {}
+        self.universe_calls = 0
         self.option_orders, self.canceled, self.exit_sides = [], [], []
 
     def get_clock(self):
@@ -276,7 +281,18 @@ class FakeClient:
 
     def get_bars(self, symbol, timeframe, lookback_days=5):
         self.bar_requests.append(symbol)
-        return self.bars
+        return self.bars_by_symbol.get(symbol, self.bars)
+
+    def get_stock_bars(self, symbols, timeframe, lookback_days=5):
+        self.bar_requests.extend(symbols)
+        return {x: [dict(b) for b in self.bars_by_symbol.get(x, self.bars)] for x in symbols}
+
+    def get_tradable_stocks(self):
+        self.universe_calls += 1
+        return self.tradable
+
+    def get_daily_stats(self, symbols):
+        return {x: self.daily_stats[x] for x in symbols if x in self.daily_stats}
 
     def get_last_exit_fill(self, symbol, after, exit_side="sell"):
         self.exit_sides.append(exit_side)
@@ -585,6 +601,51 @@ class BotTests(unittest.TestCase):
                             asset={"min_order_size": "1"})
         TradingBot(c, learner=trend_learner(c), client=client).run_once()
         self.assertEqual(client.orders, [])
+
+    # --- all major stocks ---
+    def test_universe_is_most_traded_over_min_price_built_once_a_day(self):
+        c = cfg(universe_size=2)
+        client = FakeClient(make_bars(crossover_series()), tradable=["AAA", "BBB", "CCC", "PENNY"],
+                            daily_stats={"AAA": (50, 1e8), "BBB": (20, 5e8), "CCC": (30, 1e6), "PENNY": (2, 9e9)})
+        bot = TradingBot(c, learner=trend_learner(c), client=client)
+        self.assertEqual(bot.stock_universe(client.now), ["AAPL", "BBB", "AAA"])
+        bot.stock_universe(client.now)
+        self.assertEqual(client.universe_calls, 1)
+
+    def test_best_scoring_signal_gets_the_last_slot(self):
+        c = cfg(symbols=["WEAK", "STRONG"], max_open_positions=1)
+        series = crossover_series()
+        weak, strong = make_bars(series), make_bars([x * 3 for x in series])
+
+        def fake_backtest(fn, bars, c, **kw):
+            if fn is not trend or bars[0]["c"] > 150 and bars[-1]["c"] < 150:
+                return [-1.0] * 10  # the short twins (flipped charts) lose
+            return [2.0] * 10 if bars[0]["c"] > 150 else [0.5] * 10
+
+        client = FakeClient(weak, bars_by_symbol={"WEAK": weak, "STRONG": strong})
+        TradingBot(c, learner=Learner(c, backtester=fake_backtest), client=client).run_once()
+        self.assertEqual([o[0] for o in client.orders], ["STRONG"])
+
+    def test_only_new_bars_are_downloaded_after_the_first_time(self):
+        client = FakeClient(make_bars(crossover_series()))
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        bot.run_once()
+        first = len(bot.bars["AAPL"])
+        extra = make_bars(crossover_series() + [200.0])[-1]
+        client.bars = [extra]
+        client.now += timedelta(minutes=5)
+        bot.run_once()
+        self.assertEqual(len(bot.bars["AAPL"]), first + 1)
+
+    def test_leftover_crypto_is_sold_when_crypto_is_off(self):
+        client = FakeClient(make_bars(crossover_series()), is_open=False,
+                            positions=[{"symbol": "BTCUSD", "asset_class": "crypto", "qty": "0.1",
+                                        "avg_entry_price": "100", "current_price": "100"}])
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        bot.open_trades["BTC/USD"] = {"strategy": "trend", "entry": 100.0, "stop": 90.0, "target": 120.0,
+                                      "opened_at": "x", "stop_order_id": "s1"}
+        bot.run_once()
+        self.assertEqual(client.closed, ["BTC/USD"])
 
     def test_drops_forming_bar(self):
         bars = make_bars([1, 2, 3])

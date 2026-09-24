@@ -1,7 +1,7 @@
 """Self-learning paper-trading bot for Alpaca.
 
-Trades US and world-market stocks/ETFs (long and short) and options (calls and puts)
-during US market hours, and crypto 24/7.
+Trades the ~500 most-traded US stocks and ETFs (long and short) and options (calls and
+puts) during US market hours, and optionally crypto 24/7.
 
 Run:  python -m trading_bot.bot            # trade in a loop
       python -m trading_bot.bot --once     # single pass, then exit
@@ -55,13 +55,35 @@ class TradingBot:
         self.scanned_at = None
         self.asset_cache = {}
         self.limits = None
+        self.universe = []         # the day's most-traded stocks
+        self.universe_day = None
+        self.bars = {}             # symbol -> recent closed-and-forming bars, kept between loops
+        self.last_stock_bucket = None
+        self.replayed_at = {}      # symbol -> when its strategies were last replayed
 
     @property
     def open_trades(self):
         return self.learner.state["open_trades"]
 
     # --- which symbols to trade ---
+    def _build_universe(self, today):
+        """Once a day: the universe_size most-traded US stocks/ETFs (by dollar volume) above min_price."""
+        if not self.cfg.universe_size or self.universe_day == today:
+            return
+        try:
+            stats = self.client.get_daily_stats(self.client.get_tradable_stocks())
+        except AlpacaError as exc:
+            log.error("Couldn't build today's stock list, keeping the previous one: %s", exc)
+            return
+        ranked = sorted((s for s, (price, _) in stats.items() if price >= self.cfg.min_price),
+                        key=lambda s: -stats[s][1])
+        self.universe = ranked[: self.cfg.universe_size]
+        self.universe_day = today
+        log.info("Today's stock list: the %d most-traded stocks and ETFs over $%.0f (top 10: %s)",
+                 len(self.universe), self.cfg.min_price, ", ".join(self.universe[:10]))
+
     def stock_universe(self, now):
+        self._build_universe(now.date())
         if self.cfg.scan_stocks and (self.scanned_at is None
                                      or now - self.scanned_at >= timedelta(minutes=self.cfg.rescan_minutes)):
             try:
@@ -77,7 +99,7 @@ class TradingBot:
         held = [s for s in self.open_trades if not is_crypto(s)]
         held += [t["underlying"] for t in self.open_trades.values() if t.get("underlying")]
         return list(dict.fromkeys(self.cfg.symbols + self.cfg.options_underlyings + self.cfg.world_symbols
-                                  + self.scanned + held))
+                                  + self.universe + self.scanned + held))
 
     def _asset(self, symbol):
         if symbol not in self.asset_cache:
@@ -162,6 +184,7 @@ class TradingBot:
             return
 
         self._check_managed_exits(positions)
+        self._close_disabled_crypto(positions)
 
         symbols = list(self.cfg.crypto_symbols)
         if stock_open:
@@ -174,10 +197,13 @@ class TradingBot:
             else:
                 symbols = self.stock_universe(now) + symbols
 
-        # 1) fetch bars and re-learn for every symbol that has a new closed bar
+        # 1) fetch new bars
         fresh = {}
+        stocks = [x for x in symbols if not is_crypto(x)]
+        if stocks:
+            fresh.update(self._fresh_stock_bars(stocks, now))
         for symbol in symbols:
-            if not self._due(symbol, now):
+            if not is_crypto(symbol) or not self._due(symbol, now):
                 continue
             try:
                 bars = self._get_bars(symbol, now)
@@ -186,20 +212,80 @@ class TradingBot:
                 continue
             if bars and self.last_bar_seen.get(symbol) != bars[-1]["t"]:
                 self.last_bar_seen[symbol] = bars[-1]["t"]
-                self.learner.update(symbol, bars, self._allowed(symbol))
                 fresh[symbol] = bars
 
-        # 2) pick a strategy per symbol and act on it
+        # 2) re-learn: replay strategies for the symbols whose replay is oldest (staggered, so each loop stays quick)
+        stale = [x for x in fresh if x not in self.replayed_at
+                 or now - self.replayed_at[x] >= timedelta(minutes=self.cfg.replay_minutes)]
+        stale.sort(key=lambda x: self.replayed_at.get(x, datetime.min.replace(tzinfo=now.tzinfo)))
+        for symbol in stale[: self.cfg.max_replays_per_loop]:
+            self.learner.update(symbol, fresh[symbol], self._allowed(symbol))
+            self.replayed_at[symbol] = now
+
+        # 3) manage open trades, then take the best-scoring new signals first
         stock_entries = stock_open and minutes_to_close > self.cfg.no_new_entries_minutes
+        candidates = []
         for symbol, bars in fresh.items():
+            if symbol not in self.replayed_at:
+                continue  # not learned yet
             try:
-                self._handle_symbol(symbol, bars, account, positions, pending,
-                                    allow_entries=is_crypto(symbol) or stock_entries, today=today)
+                candidate = self._handle_symbol(symbol, bars, positions, pending)
+            except AlpacaError as exc:
+                log.error("%s: %s", symbol, exc)
+                continue
+            if candidate and (is_crypto(symbol) or stock_entries):
+                candidates.append(candidate)
+        candidates.sort(key=lambda c: -c[0])
+        for i, (score, symbol, choice, signal, bars) in enumerate(candidates):
+            if len(positions) + len(pending) >= self.limits.max_positions:
+                log.info("Max open positions reached; skipped %d weaker signals", len(candidates) - i)
+                break
+            try:
+                self._enter(symbol, choice, signal, bars, account, positions, pending, today)
             except AlpacaError as exc:
                 log.error("%s: %s", symbol, exc)
         self.learner.save()
 
-    def _handle_symbol(self, symbol, bars, account, positions, pending, allow_entries, today=None):
+    def _fresh_stock_bars(self, symbols, now):
+        """Keep a rolling window of bars per stock, downloading only what's new. Runs once per new bar."""
+        minutes = _timeframe_minutes(self.cfg.timeframe)
+        bucket = int((now - timedelta(minutes=1)).timestamp() // (minutes * 60))
+        if bucket == self.last_stock_bucket:
+            return {}
+        self.last_stock_bucket = bucket
+        new = [x for x in symbols if x not in self.bars]
+        known = [x for x in symbols if x in self.bars]
+        try:
+            if new:
+                for sym, bars in self.client.get_stock_bars(new, self.cfg.timeframe, self.cfg.learn_days).items():
+                    self.bars[sym] = bars
+            if known:
+                # reach back to the oldest "latest bar" we hold, so a pause (sleep, lost wifi) leaves no gaps
+                oldest = min((self.bars[x][-1]["t"] for x in known if self.bars[x]), default=None)
+                since = (now - _parse_ts(oldest)) if oldest else timedelta(days=self.cfg.learn_days)
+                days = min(max(since, timedelta(minutes=30)), timedelta(days=self.cfg.learn_days))
+                recent = self.client.get_stock_bars(known, self.cfg.timeframe, days / timedelta(days=1))
+                for sym, bars in recent.items():
+                    have = self.bars.setdefault(sym, [])
+                    have[:] = [b for b in have if not bars or b["t"] < bars[0]["t"]] + bars
+        except AlpacaError as exc:
+            log.error("Couldn't download prices: %s", exc)
+            return {}
+        cutoff = (now - timedelta(days=self.cfg.learn_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        fresh = {}
+        for sym in symbols:
+            bars = self.bars.get(sym) or []
+            while bars and bars[0]["t"] < cutoff:
+                bars.pop(0)
+            done = completed_bars(bars, self.cfg.timeframe, now)
+            if done and self.last_bar_seen.get(sym) != done[-1]["t"]:
+                self.last_bar_seen[sym] = done[-1]["t"]
+                fresh[sym] = done
+        return fresh
+
+    def _handle_symbol(self, symbol, bars, positions, pending):
+        """Manage any open trade on this symbol; return an entry candidate
+        (score, symbol, strategy, signal, bars) if its strategy says buy, else None."""
         key = norm(symbol)
         choice, scores = self.learner.choose(symbol)
         previous = self.learner.state["active"].get(symbol)
@@ -219,24 +305,21 @@ class TradingBot:
                 target = symbol if held == key else held
                 self._act(f"EXIT {target} ({owner})", lambda: self.client.close_position(target))
                 positions.pop(held, None)
-        if key in positions or options_held:
-            return
+        if key in positions or options_held or choice is None or key in pending:
+            return None
 
-        if choice is None or key in pending:
-            return
         signal = STRATEGIES[choice](bars, self.cfg)
-        log.info("%-9s [%s] %s: %s", symbol, choice, "SHORT" if signal.action == "buy" and signal.side == "short"
-                 else signal.action.upper(), signal.reason)
         if signal.action != "buy":
-            return
-        if not allow_entries:
-            log.info("%s: too close to the close for new entries", symbol)
-            return
-        if len(positions) + len(pending) >= self.limits.max_positions:
-            log.info("%s: max open positions reached", symbol)
-            return
+            log.debug("%-9s [%s] %s", symbol, choice, signal.reason)
+            return None
+        log.info("%-9s [%s] %s signal: %s", symbol, choice, "SHORT" if signal.side == "short" else "BUY",
+                 signal.reason)
+        return (scores[choice], symbol, choice, signal, bars)
+
+    def _enter(self, symbol, choice, signal, bars, account, positions, pending, today):
+        key = norm(symbol)
         crypto = is_crypto(symbol)
-        if not crypto and self._day_trades_left(account, today or _parse_ts(bars[-1]["t"]).date()) < 1:
+        if not crypto and self._day_trades_left(account, today) < 1:
             log.info("%s: skipping, no day trades left this week (small-account rule)", symbol)
             return
 
@@ -323,6 +406,13 @@ class TradingBot:
                 log.info("%s: stop-loss parked at Alpaca at %.4g", symbol, trade["stop"])
             except AlpacaError as exc:
                 log.error("%s: could not place stop-loss: %s", symbol, exc)
+
+    def _close_disabled_crypto(self, positions):
+        """Sell crypto the bot bought earlier if crypto has since been removed from its list."""
+        for symbol in list(self.open_trades):
+            if is_crypto(symbol) and symbol not in self.cfg.crypto_symbols and norm(symbol) in positions:
+                self._act(f"SELL {symbol} (crypto trading is turned off)", lambda s=symbol: self.client.close_position(s))
+                positions.pop(norm(symbol))
 
     def _check_managed_exits(self, positions):
         """Crypto and options have no bracket orders, so enforce their stop-loss and take-profit here every loop."""

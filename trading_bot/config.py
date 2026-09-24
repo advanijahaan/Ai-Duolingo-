@@ -38,7 +38,10 @@ class Config:
     data_url: str = DATA_BASE_URL
     data_feed: str = "iex"  # free accounts only get the IEX feed
 
-    # Stocks: these are always watched, plus the most-traded stocks of the day (scan)
+    # Stocks: the day's universe_size most-traded US stocks/ETFs, plus these, plus intraday movers (scan)
+    universe_size: int = 500
+    replay_minutes: int = 30         # re-learn each stock this often (staggered)
+    max_replays_per_loop: int = 100  # bounds each loop's learning time
     symbols: list = field(default_factory=lambda: ["SPY", "QQQ"])
     # World markets through US-listed funds and foreign companies (Alpaca can't reach foreign exchanges)
     world_symbols: list = field(default_factory=lambda: [
@@ -54,10 +57,8 @@ class Config:
     min_price: float = 10.0          # skip penny stocks
     min_dollar_volume: float = 20e6  # skip thinly traded stocks
     rescan_minutes: int = 30
-    # Crypto trades 24/7
-    crypto_symbols: list = field(default_factory=lambda: [
-        "BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD",
-        "LTC/USD", "AVAX/USD", "LINK/USD", "ADA/USD", "DOT/USD"])
+    # Crypto trades 24/7. Off by default; turn on with e.g. BOT_CRYPTO=BTC/USD,ETH/USD,SOL/USD
+    crypto_symbols: list = field(default_factory=list)
     crypto_timeframe: str = "1Hour"  # 5-minute crypto moves are too small to beat the fees
     crypto_learn_days: int = 30
     crypto_cost_pct: float = 0.005   # Alpaca crypto fees are ~0.25% per side
@@ -148,10 +149,10 @@ class Config:
         if os.getenv("BOT_SHORTS", "").lower() in ("0", "off", "false", "no"):
             cfg.allow_shorts = False
         crypto = os.getenv("BOT_CRYPTO", "")
-        if crypto.lower() in ("0", "off", "false", "no"):
-            cfg.crypto_symbols = []
-        elif crypto:
+        if crypto and crypto.lower() not in ("0", "off", "false", "no"):
             cfg.crypto_symbols = _env_list("BOT_CRYPTO", cfg.crypto_symbols)
+        if os.getenv("BOT_UNIVERSE_SIZE"):
+            cfg.universe_size = int(os.getenv("BOT_UNIVERSE_SIZE"))
         cfg.data_feed = os.getenv("ALPACA_DATA_FEED", cfg.data_feed)
         cfg.state_file = os.getenv("BOT_STATE_FILE", cfg.state_file)
         return cfg

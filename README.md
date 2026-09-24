@@ -3,13 +3,16 @@ Duolingo for free
 
 ## AI day-trading bot (Alpaca paper trading)
 
-A bot that trades with **fake money** on Alpaca's paper account: **US and world stocks, options and crypto**.
+A bot that trades with **fake money** on Alpaca's paper account: **all major US stocks and ETFs, plus options**.
 It bets on prices going **up and down**. It learns which
 strategy works for each one and switches on its own.
 
 **What it trades:**
-- **Stocks:** SPY and QQQ, plus up to 40 of the day's most-traded US stocks and ETFs. It rescans every 30 minutes and
-  skips anything under $10 or thinly traded. Trading hours: Monday to Friday, 9:30 AM to 4:00 PM Eastern.
+- **Stocks:** every morning it builds a list of the **500 most-traded US stocks and ETFs** priced over $10, using
+  Alpaca's own data, so the list is always current. During the day it also adds fast-moving stocks.
+  Trading hours: Monday to Friday, 9:30 AM to 4:00 PM Eastern.
+  With that many stocks, there are often more buy signals than free slots, so it takes the ones whose strategy
+  has the best record first.
 - **World markets:** Alpaca can only trade on US exchanges, so the bot reaches other countries through funds and
   companies listed in the US. It trades these during US market hours:
   - Countries and regions: Europe, Japan, China, India, Brazil, UK, Canada, Korea, Taiwan, emerging markets.
@@ -20,7 +23,8 @@ strategy works for each one and switches on its own.
   in 1 to 3 weeks, near the current price. The most it can lose is what it paid. It sells if the option drops
   50% or doubles, and sells all options before the close.
 - **Short selling:** on other stocks Alpaca allows, it can bet on a fall by shorting.
-- **Crypto:** BTC, ETH, SOL, XRP, DOGE, LTC, AVAX, LINK, ADA and DOT. It trades **24/7**, including nights and weekends.
+- **Crypto:** off. If it still holds crypto from before, it sells it. To turn crypto back on, add
+  `BOT_CRYPTO=BTC/USD,ETH/USD` to `.env`.
 
 ### How to see what it's making (phone or computer)
 
@@ -131,8 +135,8 @@ that a strategy works. You can also add these lines to `.env`:
 - `BOT_WORLD=off`: no world markets
 - `BOT_OPTIONS=off`: trade shares instead of options
 - `BOT_SHORTS=off`: only bet on prices going up
-- `BOT_CRYPTO=BTC/USD,ETH/USD`: choose your own coins
-- `BOT_CRYPTO=off`: no crypto
+- `BOT_UNIVERSE_SIZE=200`: watch fewer stocks (useful on a slow computer)
+- `BOT_CRYPTO=BTC/USD,ETH/USD`: turn crypto on with these coins
 
 This is a learning project with fake money. How it does on paper doesn't predict real results.
 
