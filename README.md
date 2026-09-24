@@ -54,33 +54,30 @@ It sells all stocks a few minutes before the market closes. Crypto positions can
 
 To see what the AI has learned and which strategy each stock and coin is using: `python -m trading_bot.bot --report`
 
-### Keep it running 24/7 (free server, ~15 minutes, one time)
+### Keep it running 24/7 (free, no credit card)
 
-Your computer has to stay on for the bot to run, so the best option is a small free server in the cloud.
-Once it's set up, you can close everything and it keeps trading. If it ever crashes, the server restarts it
-within 5 seconds, and it starts again on its own if the server reboots.
+The bot has to run on a computer that stays on. Use one you already own: a desktop, or a laptop left plugged in.
+After a one-time setup it starts when you log in, restarts within 5 seconds if it crashes, and keeps the computer
+from sleeping. Do steps 1–5 of "How to run it on your computer" above first, so Python and `.env` are ready.
 
-1. Go to **https://console.cloud.google.com** and sign in with a Google account. Accept the free trial.
-   It asks for a card, but the server below is in Google's **always-free** tier.
-2. Open the menu (☰) → **Compute Engine** → **VM instances** → **Create instance**. Set:
-   - **Name:** `trading-bot`
-   - **Region:** `us-central1` (Iowa), `us-east1` or `us-west1`. Only these regions are free.
-   - **Machine type:** `e2-micro`
-   - **Boot disk:** click **Change** → **Ubuntu 24.04 LTS**, disk type **Standard persistent disk**, 30 GB
-   - Click **Create**.
-3. When it's ready, click the **SSH** button next to it. A black terminal window opens in your browser.
-4. Paste this and press Enter:
-   ```bash
-   sudo apt-get install -y git && git clone -b claude/jolly-mendel-hoavwy https://github.com/advanijahaan/Ai-Duolingo-.git && cd Ai-Duolingo- && bash deploy/install.sh
-   ```
-5. Paste your Alpaca paper **API Key ID** and **Secret Key** when it asks. It checks they work, then starts the bot.
-6. You'll see **Done!** You can close the window; the bot keeps running.
+**Windows:** open the project folder → `deploy` → `windows` and **double-click `install-autostart.bat`**.
+A minimized "Trading bot" window appears. Leave it running.
 
-To check on it later, click **SSH** again and run `tail -f Ai-Duolingo-/bot.log` (Ctrl+C to exit).
+**Mac:** open Terminal in the project folder and run `bash deploy/mac/install-autostart.sh`.
+
+Then keep the computer **plugged in and switched on**. Closing a laptop lid usually still makes it sleep, so leave
+the lid open. Logging out stops the bot until you log back in. Setting Windows or macOS to log in automatically
+makes it restart after a power cut too.
+
+Check on it from your phone at any time in the Alpaca app or website. The log is in `bot.log` in the project folder.
 
 ⚠️ **Run only one copy of the bot at a time.** Two copies on the same Alpaca account would both place orders.
 
-Using Docker or a paid host instead? The `Dockerfile` works anywhere. Run it with `--restart always`, as shown at the top of that file.
+<details><summary>Other ways to host it (a Linux server, Docker)</summary>
+
+- Any always-on Ubuntu/Debian server: `bash deploy/install.sh` installs it as a service that restarts itself.
+- Docker hosts: use the `Dockerfile` with `--restart always`, as shown at the top of that file.
+</details>
 
 ### How the AI works
 
