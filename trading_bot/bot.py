@@ -408,11 +408,13 @@ class TradingBot:
                 log.error("%s: could not place stop-loss: %s", symbol, exc)
 
     def _close_disabled_crypto(self, positions):
-        """Sell crypto the bot bought earlier if crypto has since been removed from its list."""
-        for symbol in list(self.open_trades):
-            if is_crypto(symbol) and symbol not in self.cfg.crypto_symbols and norm(symbol) in positions:
-                self._act(f"SELL {symbol} (crypto trading is turned off)", lambda s=symbol: self.client.close_position(s))
-                positions.pop(norm(symbol))
+        """Sell any crypto in the account that isn't on the bot's crypto list (crypto is off by default)."""
+        wanted = {norm(x) for x in self.cfg.crypto_symbols}
+        for key, pos in list(positions.items()):
+            if pos.get("asset_class") == "crypto" and key not in wanted:
+                self._act(f"SELL {pos['symbol']} (crypto trading is turned off)",
+                          lambda k=key: self.client.close_position(k))
+                positions.pop(key)
 
     def _check_managed_exits(self, positions):
         """Crypto and options have no bracket orders, so enforce their stop-loss and take-profit here every loop."""

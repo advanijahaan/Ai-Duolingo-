@@ -36,7 +36,7 @@ strategy works for each one and switches on its own.
    - **Orders:** every buy and sell the bot made. Click an order to open its details. The **Client Order ID**
      starts with the strategy the AI used, e.g. `breakout-AMD-1a2b3c4d`.
 
-It sells all stocks a few minutes before the market closes. Crypto positions can stay open overnight.
+It sells everything a few minutes before the market closes, so it holds nothing overnight.
 
 ### How to run it on your computer (one-time setup, ~5 minutes)
 

@@ -641,11 +641,9 @@ class BotTests(unittest.TestCase):
         client = FakeClient(make_bars(crossover_series()), is_open=False,
                             positions=[{"symbol": "BTCUSD", "asset_class": "crypto", "qty": "0.1",
                                         "avg_entry_price": "100", "current_price": "100"}])
-        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
-        bot.open_trades["BTC/USD"] = {"strategy": "trend", "entry": 100.0, "stop": 90.0, "target": 120.0,
-                                      "opened_at": "x", "stop_order_id": "s1"}
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)  # no memory of buying it
         bot.run_once()
-        self.assertEqual(client.closed, ["BTC/USD"])
+        self.assertEqual(client.closed, ["BTCUSD"])
 
     def test_drops_forming_bar(self):
         bars = make_bars([1, 2, 3])
