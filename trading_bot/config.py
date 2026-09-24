@@ -50,6 +50,25 @@ class Config:
     atr_period: int = 14
     stop_atr_mult: float = 1.5
     take_profit_atr_mult: float = 3.0
+    # mean reversion
+    mr_sma: int = 20
+    mr_oversold: float = 30.0
+    mr_exit_rsi: float = 55.0
+    mr_target_atr_mult: float = 2.0
+    # breakout
+    breakout_lookback: int = 20
+    breakout_exit_lookback: int = 10
+    breakout_volume_mult: float = 1.5
+    breakout_stop_atr_mult: float = 2.0
+    breakout_target_atr_mult: float = 4.0
+
+    # Learning: which strategy each symbol uses
+    learn_days: int = 10          # calendar days of history to replay each strategy on
+    prior_strength: float = 10.0  # trades' worth of "assume average" before trusting a symbol's own record
+    live_weight: float = 2.0      # a real trade counts as much as this many replayed ones
+    min_score: float = 0.05       # sit a symbol out unless the best strategy expects > this many R per trade
+    cost_pct: float = 0.0005      # assumed round-trip slippage when replaying
+    state_file: str = "bot_state.json"
 
     # Risk
     risk_per_trade: float = 0.01      # risk 1% of equity per trade

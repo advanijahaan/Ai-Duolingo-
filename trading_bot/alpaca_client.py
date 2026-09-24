@@ -42,7 +42,7 @@ class AlpacaClient:
         return self._trade("GET", "/orders", params={"status": "open", "limit": 500})
 
     # --- orders ---
-    def submit_bracket_buy(self, symbol, qty, take_profit, stop_loss):
+    def submit_bracket_buy(self, symbol, qty, take_profit, stop_loss, client_order_id=None):
         body = {
             "symbol": symbol,
             "qty": str(qty),
@@ -53,7 +53,22 @@ class AlpacaClient:
             "take_profit": {"limit_price": f"{take_profit:.2f}"},
             "stop_loss": {"stop_price": f"{stop_loss:.2f}"},
         }
+        if client_order_id:
+            body["client_order_id"] = client_order_id
         return self._trade("POST", "/orders", json=body)
+
+    def get_last_sell_fill(self, symbol, after):
+        """Average fill price of the most recent filled sell of `symbol` since `after` (ISO time)."""
+        orders = self._trade("GET", "/orders", params={
+            "status": "closed", "symbols": symbol, "after": after,
+            "direction": "desc", "nested": "true", "limit": 50,
+        }) or []
+        fills = []
+        for order in orders:
+            for o in [order] + (order.get("legs") or []):
+                if o["side"] == "sell" and o["status"] == "filled" and o.get("filled_avg_price"):
+                    fills.append((o["filled_at"], float(o["filled_avg_price"])))
+        return max(fills)[1] if fills else None
 
     def close_position(self, symbol):
         # Cancel the bracket legs first, otherwise the shares are held by them.
