@@ -58,10 +58,12 @@ To see what the AI has learned and which strategy each stock and coin is using: 
 
 The bot has to run on a computer that stays on. Use one you already own: a desktop, or a laptop left plugged in.
 After a one-time setup it starts when you log in, restarts within 5 seconds if it crashes, and keeps the computer
-from sleeping. Do steps 1–5 of "How to run it on your computer" above first, so Python and `.env` are ready.
+from sleeping. On a Mac, do steps 1–5 of "How to run it on your computer" above first.
 
-**Windows:** open the project folder → `deploy` → `windows` and **double-click `install-autostart.bat`**.
-A minimized "Trading bot" window appears. Leave it running.
+**Windows (easiest):** download
+[this ZIP](https://github.com/advanijahaan/Ai-Duolingo-/archive/refs/heads/claude/jolly-mendel-hoavwy.zip),
+right-click it → **Extract All**, open the extracted folder and **double-click `SETUP.bat`**. It installs Python if
+needed, asks for your keys, checks they work and starts the bot. You can skip the steps above.
 
 **Mac:** open Terminal in the project folder and run `bash deploy/mac/install-autostart.sh`.
 

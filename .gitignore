@@ -5,3 +5,5 @@ bot.log
 bot_state.json
 bot_state.json.tmp
 .venv/
+.python-path
+setup-check.log
