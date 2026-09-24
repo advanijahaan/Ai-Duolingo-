@@ -61,7 +61,7 @@ After a one-time setup it starts when you log in, restarts within 5 seconds if i
 from sleeping. On a Mac, do steps 1–5 of "How to run it on your computer" above first.
 
 **Windows (easiest):** download
-[this ZIP](https://github.com/advanijahaan/Ai-Duolingo-/archive/refs/heads/claude/jolly-mendel-hoavwy.zip),
+[this ZIP](https://github.com/advanijahaan/Ai-trading/archive/refs/heads/claude/jolly-mendel-hoavwy.zip),
 right-click it → **Extract All**, open the extracted folder and **double-click `SETUP.bat`**. It installs Python if
 needed, asks for your keys, checks they work and starts the bot. You can skip the steps above.
 
