@@ -1,5 +1,6 @@
 import os
 import unittest
+import uuid
 from datetime import datetime, timedelta, timezone
 from unittest import mock
 
@@ -9,7 +10,8 @@ from trading_bot.risk import account_limits, daily_loss_hit, option_contracts, p
 import tempfile
 
 from trading_bot.learner import Learner, backtest
-from trading_bot.strategy import STRATEGIES, Signal, atr, breakout, ema, mean_reversion, mirror, rsi, trend
+from trading_bot.strategy import (STRATEGIES, Signal, annotate_sessions, atr, breakout, ema, intraday_momentum,
+                                   mean_reversion, mirror, orb, rsi, trend, vwap_trend)
 
 T0 = datetime(2026, 9, 24, 14, 0, tzinfo=timezone.utc)
 
@@ -34,7 +36,7 @@ def cfg(**kw):
     c.options_underlyings = []
     c.crypto_symbols = []
     c.crypto_timeframe = "5Min"
-    c.state_file = os.path.join(STATE_DIR, f"state-{id(c)}.json")
+    c.state_file = os.path.join(STATE_DIR, f"state-{uuid.uuid4().hex}.json")
     for k, v in kw.items():
         setattr(c, k, v)
     return c
@@ -147,7 +149,7 @@ class BacktestTests(unittest.TestCase):
 class LearnerTests(unittest.TestCase):
     def test_picks_best_and_shrinks_small_samples(self):
         results = {"trend": [0.5] * 20, "mean_reversion": [3.0], "breakout": [-1.0] * 5}
-        learner = Learner(cfg(), backtester=lambda fn, bars, c, **kw: results[fn.__name__])
+        learner = Learner(cfg(), backtester=lambda fn, bars, c, **kw: results.get(fn.__name__, [-1.0] * 5))
         learner.update("AAPL", [])
         choice, scores = learner.choose("AAPL")
         self.assertEqual(choice, "trend")  # one lucky 3R trade shouldn't beat a steady record
@@ -163,6 +165,66 @@ class LearnerTests(unittest.TestCase):
         reloaded = Learner(c, backtester=learner.backtester)
         reloaded.update("AAPL", [])
         self.assertNotEqual(reloaded.choose("AAPL")[0], "trend")
+
+
+def session_days(days, today=None):
+    """Regular-session 5-minute bars (9:30-16:00 New York = 13:30-20:00 UTC in September), flat at 100
+    with 1,000 shares a bar, for `days` past days, then `today` (a list of (open, high, low, close, volume))."""
+    bars = []
+    for d in range(days):
+        for i in range(78):
+            t = datetime(2026, 9, 14 + d, 13, 30, tzinfo=timezone.utc) + timedelta(minutes=5 * i)
+            bars.append({"t": t.isoformat().replace("+00:00", "Z"), "o": 100.0, "h": 100.3, "l": 99.7,
+                         "c": 100.0, "v": 1000})
+    for i, (o, h, l, c, v) in enumerate(today or []):
+        t = datetime(2026, 9, 14 + days, 13, 30, tzinfo=timezone.utc) + timedelta(minutes=5 * i)
+        bars.append({"t": t.isoformat().replace("+00:00", "Z"), "o": o, "h": h, "l": l, "c": c, "v": v})
+    return annotate_sessions(bars)
+
+
+class SessionStrategyTests(unittest.TestCase):
+    def test_annotation(self):
+        bars = session_days(4, [(100, 101, 99.5, 100.8, 5000), (100.8, 101.5, 100.7, 101.4, 1500)])
+        b = bars[-1]
+        self.assertEqual((b["_min"], b["_orh"], b["_orl"]), (9 * 60 + 35, 101, 99.5))
+        self.assertAlmostEqual(b["_rv"], 5.0)
+        self.assertEqual(b["_pc"], 100.0)
+        self.assertEqual(bars[0]["_min"], 9 * 60 + 30)
+
+    def test_orb_buys_breakout_on_stock_in_play(self):
+        bars = session_days(4, [(100, 101, 99.5, 100.8, 5000), (100.8, 101.5, 100.7, 101.4, 1500)])
+        sig = orb(bars, cfg())
+        self.assertEqual(sig.action, "buy")
+        self.assertEqual(sig.stop, 99.5)
+
+    def test_orb_ignores_normal_volume_and_short_twin_catches_breakdowns(self):
+        quiet = session_days(4, [(100, 101, 99.5, 100.8, 1000), (100.8, 101.5, 100.7, 101.4, 1500)])
+        self.assertEqual(orb(quiet, cfg()).action, "hold")
+        down = session_days(4, [(100, 100.5, 99, 99.2, 5000), (99.2, 99.3, 98.5, 98.6, 1500)])
+        sig = STRATEGIES["orb_short"](down, cfg())
+        self.assertEqual((sig.action, sig.side), ("buy", "short"))
+        self.assertAlmostEqual(sig.stop, 100.5)
+
+    def test_vwap_cross(self):
+        today = [(100, 100.2, 98.8, 99.0, 3000)] * 3 + [(99.0, 99.1, 98.9, 99.0, 1000)] * 2
+        below = session_days(4, today)
+        self.assertEqual(vwap_trend(below, cfg()).action, "sell")
+        crossed = session_days(4, today + [(99.0, 101.2, 99.0, 101.0, 4000)])
+        self.assertEqual(vwap_trend(crossed, cfg()).action, "buy")
+
+    def test_intraday_momentum_at_1530(self):
+        def day(ten_oclock_close):
+            bars = [(100, 100.3, 99.7, 100, 1000)] * 78
+            bars[5] = (100, 101.3, 99.7, ten_oclock_close, 1000)  # the 9:55 bar closes at 10:00
+            return bars[:72]  # up to the bar that closes at 15:30
+        self.assertEqual(intraday_momentum(session_days(4, day(101)), cfg()).action, "buy")
+        self.assertEqual(intraday_momentum(session_days(4, day(99)), cfg()).action, "hold")
+        self.assertEqual(STRATEGIES["intraday_momentum_short"](session_days(4, day(99)), cfg()).action, "buy")
+
+    def test_session_strategies_skip_unannotated_bars(self):
+        bars = make_bars([100.0] * 40)
+        for fn in (orb, vwap_trend, intraday_momentum):
+            self.assertEqual(fn(bars, cfg()).action, "hold")
 
 
 class ShortAndOptionTests(unittest.TestCase):
@@ -272,6 +334,9 @@ class FakeClient:
 
     def get_most_active_stocks(self, top):
         return self.actives
+
+    def get_movers(self, top=20):
+        return getattr(self, "movers", [])
 
     def get_positions(self):
         return self.positions

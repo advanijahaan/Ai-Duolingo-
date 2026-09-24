@@ -19,7 +19,7 @@ from .alpaca_client import AlpacaClient, AlpacaError, is_crypto, norm
 from .config import Config
 from .learner import Learner
 from .risk import account_limits, daily_loss_hit, option_contracts, pick_option, position_size
-from .strategy import LONG_STRATEGIES, STRATEGIES
+from .strategy import LONG_STRATEGIES, STRATEGIES, annotate_sessions
 
 log = logging.getLogger("trading_bot")
 
@@ -89,10 +89,13 @@ class TradingBot:
             try:
                 found = [sym for sym, price, dollar_vol in self.client.get_most_active_stocks(self.cfg.scan_top)
                          if price >= self.cfg.min_price and dollar_vol >= self.cfg.min_dollar_volume]
+                # the day's biggest movers: the "stocks in play" day traders focus on
+                found += [sym for sym, price, _ in self.client.get_movers(self.cfg.movers_top)
+                          if price >= self.cfg.min_price and sym.isalpha() and sym not in found]
                 added = set(found[: self.cfg.max_scanned]) - set(self.scanned)
                 self.scanned = found[: self.cfg.max_scanned]
                 self.scanned_at = now
-                log.info("Stock scan: watching %d most-traded stocks%s", len(self.scanned),
+                log.info("Stock scan: watching %d most-traded stocks and big movers%s", len(self.scanned),
                          f" (new: {', '.join(sorted(added))})" if added else "")
             except AlpacaError as exc:
                 log.error("Stock scan failed, keeping previous list: %s", exc)
@@ -147,7 +150,8 @@ class TradingBot:
     def _get_bars(self, symbol, now):
         days = self.cfg.crypto_learn_days if is_crypto(symbol) else self.cfg.learn_days
         timeframe = self._timeframe(symbol)
-        return completed_bars(self.client.get_bars(symbol, timeframe, days), timeframe, now)
+        bars = completed_bars(self.client.get_bars(symbol, timeframe, days), timeframe, now)
+        return bars if is_crypto(symbol) else annotate_sessions(bars)
 
     def _due(self, symbol, now):
         """Only fetch bars when a new bar should have closed since the last one we saw."""
@@ -280,7 +284,7 @@ class TradingBot:
             done = completed_bars(bars, self.cfg.timeframe, now)
             if done and self.last_bar_seen.get(sym) != done[-1]["t"]:
                 self.last_bar_seen[sym] = done[-1]["t"]
-                fresh[sym] = done
+                fresh[sym] = annotate_sessions(done)
         return fresh
 
     def _handle_symbol(self, symbol, bars, positions, pending):

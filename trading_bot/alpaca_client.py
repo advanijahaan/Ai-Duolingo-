@@ -217,6 +217,13 @@ class AlpacaClient:
                 params["page_token"] = data["next_page_token"]
         return out
 
+    def get_movers(self, top=20):
+        """Today's biggest gainers and losers: [(symbol, price, percent_change)]."""
+        data_root = self.cfg.data_url.rsplit("/", 1)[0]
+        data = self._request("GET", f"{data_root}/v1beta1/screener/stocks/movers", params={"top": top}) or {}
+        return [(m["symbol"], m.get("price", 0), m.get("percent_change", 0))
+                for m in (data.get("gainers") or []) + (data.get("losers") or [])]
+
     def get_bars(self, symbol, timeframe, lookback_days=5):
         start = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
         params = {"symbols": symbol, "timeframe": timeframe, "start": start, "limit": 10000}

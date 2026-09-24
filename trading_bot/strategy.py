@@ -9,8 +9,61 @@ Every strategy also has a "_short" twin that bets on prices falling. It runs the
 same rules on an upside-down price chart (see mirror). For a short, stop is
 above the price and target is below it.
 The learner (learner.py) decides which strategy each symbol should use.
+
+The session strategies (orb, vwap_trend, intraday_momentum) come from published research
+on US stocks and need each bar marked with its trading-session data (see annotate_sessions).
 """
 from dataclasses import dataclass, replace
+from datetime import datetime
+
+try:
+    from zoneinfo import ZoneInfo
+    NEW_YORK = ZoneInfo("America/New_York")
+except Exception:  # Windows without the tzdata package
+    NEW_YORK = None
+
+OPEN_MIN, CLOSE_MIN = 9 * 60 + 30, 16 * 60  # regular session, minutes after midnight New York time
+
+
+def _ny_day_and_minute(t):
+    dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
+    if NEW_YORK is not None:
+        dt = dt.astimezone(NEW_YORK)
+    else:  # rough fallback: daylight-saving offset
+        from datetime import timedelta, timezone
+        dt = dt.astimezone(timezone(timedelta(hours=-4)))
+    return dt.date().isoformat(), dt.hour * 60 + dt.minute
+
+
+def annotate_sessions(bars, rel_volume_days=14):
+    """Mark each stock bar (in place) with its session data, in one pass:
+    _day/_min (New York date and minute of the bar's start), _orh/_orl/_oro/_orc (today's first
+    5-minute bar), _rv (that bar's volume relative to the average first bar of recent days),
+    _vwap (today's volume-weighted average price so far), _pc (previous session's close) and
+    _c10 (today's close at 10:00). Bars outside 9:30-16:00 get _min only. Returns bars."""
+    day, first, pv, vol, prev_close, last_close, c10 = None, None, 0.0, 0.0, None, None, None
+    first_volumes = []
+    for b in bars:
+        if "_min" not in b:
+            b["_day"], b["_min"] = _ny_day_and_minute(b["t"])
+        if not OPEN_MIN <= b["_min"] < CLOSE_MIN:
+            b["_orh"] = None
+            continue
+        if b["_day"] != day:  # a new session starts
+            if first is not None:
+                first_volumes.append(first["v"])
+                prev_close = last_close
+            day, first, pv, vol, c10 = b["_day"], b, 0.0, 0.0, None
+            recent = first_volumes[-rel_volume_days:]
+            b["_rv_today"] = b["v"] / (sum(recent) / len(recent)) if len(recent) >= 3 and sum(recent) else None
+        typical = (b["h"] + b["l"] + b["c"]) / 3
+        pv, vol = pv + typical * b["v"], vol + b["v"]
+        if b["_min"] == 595:  # the 9:55 bar closes at 10:00
+            c10 = b["c"]
+        b["_orh"], b["_orl"], b["_oro"], b["_orc"] = first["h"], first["l"], first["o"], first["c"]
+        b["_rv"], b["_vwap"], b["_pc"], b["_c10"] = first.get("_rv_today"), pv / vol if vol else b["c"], prev_close, c10
+        last_close = b["c"]
+    return bars
 
 
 def ema(values, period):
@@ -146,8 +199,13 @@ def mirror(bars, k=None):
     With k = last close**2 the last close is unchanged, and prices map back the same way.
     """
     k = k or bars[-1]["c"] ** 2
-    return [{"t": b["t"], "o": k / b["o"], "h": k / b["l"], "l": k / b["h"], "c": k / b["c"], "v": b["v"]}
-            for b in bars]
+    flipped = [{"t": b["t"], "o": k / b["o"], "h": k / b["l"], "l": k / b["h"], "c": k / b["c"], "v": b["v"]}
+               for b in bars]
+    if bars and "_min" in bars[-1]:  # keep session data (cheap: no timestamp parsing again)
+        for f, b in zip(flipped, bars):
+            f["_day"], f["_min"] = b["_day"], b["_min"]
+        annotate_sessions(flipped)
+    return flipped
 
 
 def short_version(fn):
@@ -164,5 +222,67 @@ def short_version(fn):
 
 
 LONG_STRATEGIES = {"trend": trend, "mean_reversion": mean_reversion, "breakout": breakout}
+def _session(bars):
+    """Today's bars so far, if the latest bar is annotated and inside the regular session."""
+    b = bars[-1] if bars else {}
+    if b.get("_orh") is None:
+        return None
+    return b
+
+
+def orb(bars, cfg):
+    """Opening range breakout on stocks in play (Zarattini, Barbon & Aziz): the first 5 minutes set
+    a range; on a stock trading far above its usual opening volume, buy when price breaks above the
+    range after an up opening bar. Stop at the range low; hold until the close."""
+    b = _session(bars)
+    if b is None:
+        return Signal("hold", reason="needs stock session data")
+    if b["_min"] == OPEN_MIN or b["_min"] > OPEN_MIN + cfg.orb_entry_window_minutes:
+        return Signal("hold", price=b["c"], reason="outside the opening-range window")
+    if b["_rv"] is None or b["_rv"] < cfg.orb_min_rel_volume:
+        return Signal("hold", price=b["c"], reason="not in play (normal opening volume)")
+    prev = bars[-2] if len(bars) > 1 else b
+    same_day = prev.get("_day") == b["_day"]
+    if b["_orc"] > b["_oro"] and b["c"] > b["_orh"] and (not same_day or prev["c"] <= b["_orh"]):
+        risk = b["c"] - b["_orl"]
+        if risk <= 0:
+            return Signal("hold", price=b["c"], reason="no room for a stop")
+        return Signal("buy", price=b["c"], stop=b["_orl"], target=b["c"] + cfg.orb_target_r * risk,
+                      reason=f"broke the opening range high {b['_orh']:.2f}, opening volume {b['_rv']:.1f}x normal")
+    return Signal("hold", price=b["c"], reason="no opening-range breakout")
+
+
+def vwap_trend(bars, cfg):
+    """VWAP trend (Zarattini & Aziz): buy when price crosses above today's volume-weighted average
+    price, get out when it falls back below."""
+    b = _session(bars)
+    if b is None:
+        return Signal("hold", reason="needs stock session data")
+    price, vwap = b["c"], b["_vwap"]
+    if price < vwap:
+        return Signal("sell", price=price, reason=f"below VWAP {vwap:.2f}")
+    prev = bars[-2] if len(bars) > 1 else b
+    if (b["_min"] >= OPEN_MIN + cfg.vwap_skip_minutes and prev.get("_day") == b["_day"]
+            and prev["c"] <= prev.get("_vwap", prev["c"])):
+        return _entry(bars, cfg, cfg.stop_atr_mult, cfg.vwap_target_atr_mult, f"crossed above VWAP {vwap:.2f}")
+    return Signal("hold", price=price, reason=f"above VWAP {vwap:.2f}, no fresh cross")
+
+
+def intraday_momentum(bars, cfg):
+    """Market intraday momentum (Gao, Han, Li & Zhou, 2018): if the first half hour (previous close
+    to 10:00) was up, buy at 15:30 for the last half hour."""
+    b = _session(bars)
+    if b is None:
+        return Signal("hold", reason="needs stock session data")
+    if b["_min"] != cfg.im_entry_minute or not b["_pc"] or not b["_c10"]:
+        return Signal("hold", price=b["c"], reason="not the 15:30 entry bar")
+    first_half_hour = b["_c10"] / b["_pc"] - 1
+    if first_half_hour > cfg.im_min_move:
+        return _entry(bars, cfg, cfg.stop_atr_mult, cfg.take_profit_atr_mult,
+                      f"first half hour up {first_half_hour:+.2%}")
+    return Signal("hold", price=b["c"], reason=f"first half hour {first_half_hour:+.2%}")
+
+
+LONG_STRATEGIES.update({"orb": orb, "vwap_trend": vwap_trend, "intraday_momentum": intraday_momentum})
 STRATEGIES = dict(LONG_STRATEGIES)
 STRATEGIES.update({f"{name}_short": short_version(fn) for name, fn in LONG_STRATEGIES.items()})

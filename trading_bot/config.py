@@ -40,8 +40,8 @@ class Config:
 
     # Stocks: the day's universe_size most-traded US stocks/ETFs, plus these, plus intraday movers (scan)
     universe_size: int = 500
-    replay_minutes: int = 30         # re-learn each stock this often (staggered)
-    max_replays_per_loop: int = 100  # bounds each loop's learning time
+    replay_minutes: int = 45         # re-learn each stock this often (staggered)
+    max_replays_per_loop: int = 60   # bounds each loop's learning time
     symbols: list = field(default_factory=lambda: ["SPY", "QQQ"])
     # World markets through US-listed funds and foreign companies (Alpaca can't reach foreign exchanges)
     world_symbols: list = field(default_factory=lambda: [
@@ -57,6 +57,7 @@ class Config:
     min_price: float = 10.0          # skip penny stocks
     min_dollar_volume: float = 20e6  # skip thinly traded stocks
     rescan_minutes: int = 30
+    movers_top: int = 20             # also watch the day's top gainers and losers
     # Crypto trades 24/7. Off by default; turn on with e.g. BOT_CRYPTO=BTC/USD,ETH/USD,SOL/USD
     crypto_symbols: list = field(default_factory=list)
     crypto_timeframe: str = "1Hour"  # 5-minute crypto moves are too small to beat the fees
@@ -96,6 +97,16 @@ class Config:
     breakout_volume_mult: float = 1.5
     breakout_stop_atr_mult: float = 2.0
     breakout_target_atr_mult: float = 4.0
+    # opening range breakout (stocks in play)
+    orb_min_rel_volume: float = 2.0      # first 5 minutes' volume vs. the usual first 5 minutes
+    orb_entry_window_minutes: int = 90   # only take breakouts before 11:00
+    orb_target_r: float = 10.0           # effectively "hold until the close"
+    # VWAP trend
+    vwap_skip_minutes: int = 15          # VWAP is noisy right after the open
+    vwap_target_atr_mult: float = 4.0
+    # intraday momentum
+    im_entry_minute: int = 15 * 60 + 25  # the bar that closes at 15:30 New York time
+    im_min_move: float = 0.0
 
     # Learning: which strategy each symbol uses
     learn_days: int = 10          # calendar days of history to replay each strategy on
@@ -115,7 +126,7 @@ class Config:
     pdt_protection: bool = True         # respect the US pattern-day-trader limit below pdt_equity
     pdt_equity: float = 25000.0
     pdt_max_day_trades: int = 3         # per rolling 5 business days
-    no_new_entries_minutes: int = 30  # before close
+    no_new_entries_minutes: int = 25  # before close (15:35), so the 15:30 momentum entry fits
     flatten_minutes: int = 10         # close everything this long before close
 
     @classmethod

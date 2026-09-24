@@ -9,7 +9,8 @@ strategy works for each one and switches on its own.
 
 **What it trades:**
 - **Stocks:** every morning it builds a list of the **500 most-traded US stocks and ETFs** priced over $10, using
-  Alpaca's own data, so the list is always current. During the day it also adds fast-moving stocks.
+  Alpaca's own data, so the list is always current. During the day it also adds the most-traded stocks and the day's biggest gainers and losers, the "stocks in play"
+  day traders focus on.
   Trading hours: Monday to Friday, 9:30 AM to 4:00 PM Eastern.
   With that many stocks, there are often more buy signals than free slots, so it takes the ones whose strategy
   has the best record first.
@@ -90,15 +91,19 @@ Check on it from your phone at any time in the Alpaca app or website. The log is
 
 ### How the AI works
 
-The bot has 3 strategies, each in an "up" version and a "down" (`_short`) version. That makes 6 in total:
+The bot has 6 strategies, each in an "up" version and a "down" (`_short`) version. That makes 12 in total.
+The last three come from published research on US stocks:
 
 | Strategy | Buys when… | Sells when… |
 |---|---|---|
 | `trend` | the short-term average price crosses above the longer-term one | it crosses back below |
 | `mean_reversion` | a stock that dropped too far starts bouncing back (RSI climbs back above 30) | price gets back to its average |
 | `breakout` | price breaks above its recent high on heavy volume | price falls below its recent low |
+| `orb` (opening range breakout) | on a stock trading far more than usual at the open (a "stock in play"), price breaks above the first 5 minutes' high after an up start ([Zarattini, Barbon & Aziz](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4729284)) | stop at the first 5 minutes' low, otherwise at the close |
+| `vwap_trend` | price crosses above VWAP, the day's volume-weighted average price that professional desks trade against ([Zarattini & Aziz](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4631351)) | price falls back below VWAP |
+| `intraday_momentum` | at 3:30 PM, if the stock rose in the first half hour (previous close to 10:00) ([Gao, Han, Li & Zhou, 2018](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2440866)) | at the close |
 
-The `_short` versions (`trend_short`, `mean_reversion_short`, `breakout_short`) are the mirror images. They bet on
+The `_short` versions (`trend_short`, `orb_short` and so on) are the mirror images. They bet on
 a fall by shorting the stock or buying a put. Crypto only uses the "up" versions because Alpaca doesn't allow
 shorting crypto.
 
