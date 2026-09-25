@@ -25,31 +25,55 @@ def _day(bar):
     return bar["t"][:10]
 
 
+def _timeframe_minutes(timeframe):
+    return int(timeframe[:-3]) if timeframe.endswith("Min") else int(timeframe[:-4]) * 60
+
+
+def trail_stop(stop, entry, risk, best, cfg):
+    """Once a trade is up by trail_start_r times its risk, drag the stop up behind the best price
+    (trail_r times the risk below it), so a winner can't turn into a loser."""
+    if cfg.trail_start_r and best - entry >= cfg.trail_start_r * risk:
+        return max(stop, best - cfg.trail_r * risk)
+    return stop
+
+
 def backtest(strategy, bars, cfg, eod_exit=True, cost_pct=None):
     """Replay `strategy` over `bars` and return the R-multiple of each closed trade.
 
-    Entries fill at the signal bar's close. A stop or target is checked from the
-    next bar. If both are touched in one bar the stop is assumed (pessimistic).
-    With eod_exit (stocks) positions are closed at the last bar of each day, like the live bot.
+    Entries fill at the signal bar's close. Stops and targets are checked from the next bar;
+    if both are touched in one bar the stop is assumed (pessimistic). The stop trails the best
+    price once the trade is ahead (see trail_stop), and with eod_exit (stocks) trades are closed
+    after max_hold_minutes and at the last bar of each day, like the live bot. Strategies marked
+    `overnight` are held into the next session and those marked `hold_to_close` skip the time limit.
     """
     cost_pct = cfg.cost_pct if cost_pct is None else cost_pct
+    overnight = getattr(strategy, "overnight", False)
+    max_bars = 0
+    if eod_exit and cfg.max_hold_minutes and not overnight and not getattr(strategy, "hold_to_close", False):
+        max_bars = cfg.max_hold_minutes // _timeframe_minutes(cfg.timeframe)
     results, pos = [], None
     for i in range(WARMUP_BARS, len(bars)):
         bar = bars[i]
-        last_of_day = eod_exit and i + 1 < len(bars) and _day(bars[i + 1]) != _day(bar)
+        new_day_next = i + 1 < len(bars) and _day(bars[i + 1]) != _day(bar)
+        last_of_day = eod_exit and not overnight and new_day_next
 
         if pos:
+            pos["held"] += 1
             exit_price = None
             if bar["l"] <= pos["stop"]:
                 exit_price = min(bar["o"], pos["stop"])
             elif bar["h"] >= pos["target"]:
                 exit_price = max(bar["o"], pos["target"])
-            elif last_of_day or strategy(bars[max(0, i - WINDOW):i + 1], cfg).action == "sell":
+            elif (last_of_day or (max_bars and pos["held"] >= max_bars)
+                  or strategy(bars[max(0, i - WINDOW):i + 1], cfg).action == "sell"):
                 exit_price = bar["c"]
             if exit_price is not None:
                 cost = pos["entry"] * cost_pct
                 results.append((exit_price - pos["entry"] - cost) / pos["risk"])
                 pos = None
+            else:
+                pos["best"] = max(pos["best"], bar["h"])
+                pos["stop"] = trail_stop(pos["stop"], pos["entry"], pos["risk"], pos["best"], cfg)
             continue
 
         if last_of_day or i + 1 == len(bars):
@@ -57,7 +81,7 @@ def backtest(strategy, bars, cfg, eod_exit=True, cost_pct=None):
         sig = strategy(bars[max(0, i - WINDOW):i + 1], cfg)
         if sig.action == "buy" and sig.stop < sig.price:
             pos = {"entry": sig.price, "stop": sig.stop, "target": sig.target,
-                   "risk": sig.price - sig.stop}
+                   "risk": sig.price - sig.stop, "best": sig.price, "held": 0}
     return results
 
 

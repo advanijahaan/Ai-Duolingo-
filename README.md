@@ -37,7 +37,8 @@ strategy works for each one and switches on its own.
    - **Orders:** every buy and sell the bot made. Click an order to open its details. The **Client Order ID**
      starts with the strategy the AI used, e.g. `breakout-AMD-1a2b3c4d`.
 
-It sells everything a few minutes before the market closes, so it holds nothing overnight.
+It sells everything a few minutes before the market closes, except trades from the `overnight_hold` strategy,
+which are held until just after the next open.
 
 ### How to run it on your computer (one-time setup, ~5 minutes)
 
@@ -91,8 +92,8 @@ Check on it from your phone at any time in the Alpaca app or website. The log is
 
 ### How the AI works
 
-The bot has 6 strategies, each in an "up" version and a "down" (`_short`) version. That makes 12 in total.
-The last three come from published research on US stocks:
+The bot has 7 strategies, each in an "up" version and a "down" (`_short`) version. That makes 14 in total.
+The last four come from published research on US stocks:
 
 | Strategy | Buys when… | Sells when… |
 |---|---|---|
@@ -101,6 +102,7 @@ The last three come from published research on US stocks:
 | `breakout` | price breaks above its recent high on heavy volume | price falls below its recent low |
 | `orb` (opening range breakout) | on a stock trading far more than usual at the open (a "stock in play"), price breaks above the first 5 minutes' high after an up start ([Zarattini, Barbon & Aziz](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4729284)) | stop at the first 5 minutes' low, otherwise at the close |
 | `vwap_trend` | price crosses above VWAP, the day's volume-weighted average price that professional desks trade against ([Zarattini & Aziz](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=4631351)) | price falls back below VWAP |
+| `overnight_hold` | at 3:50 PM, to hold overnight. Historically, most US stock gains came between the close and the next open ([Cliff, Cooper & Gulen](https://www.ssrn.com/abstract=1004081)). Overnight holds never count as day trades. | 9:35 AM the next morning |
 | `intraday_momentum` | at 3:30 PM, if the stock rose in the first half hour (previous close to 10:00) ([Gao, Han, Li & Zhou, 2018](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=2440866)) | at the close |
 
 The `_short` versions (`trend_short`, `orb_short` and so on) are the mirror images. They bet on
@@ -126,6 +128,16 @@ whether you start with $10 or $100,000:
 | $100 – $2,000 | up to 4 positions, each up to a quarter of the account |
 | $2,000 and up | normal mode: up to 8 positions, plus short selling and options |
 | under $25,000 | stays within the US **day-trading limit** (3 same-day round trips in 5 business days), so a sell is never blocked. Crypto isn't affected. Turn this off with `BOT_PDT=off` if the rule doesn't apply to your account. |
+
+**How trades end:**
+- Every trade starts with a stop-loss.
+- Once a trade is up by the amount it risked, the stop follows the price up (1x the risk below the best price so
+  far), so a winner can't turn into a loser.
+- Trades are closed after **2 hours**, except `orb`, `intraday_momentum` and `overnight_hold`, which have their own
+  timing.
+- Outside market hours stop orders don't work. So if an overnight hold drops below its stop in pre-market,
+  after-hours or Alpaca's overnight session, the bot sells it with an extended-hours limit order.
+- The AI's replays use exactly these rules, so what it learns matches how trades really run.
 
 **Safety limits:** every buy comes with a stop-loss and a take-profit. Each trade risks about 1% of the account.
 Options risk about 1% of the account each, counting a 50% drop as the full loss.

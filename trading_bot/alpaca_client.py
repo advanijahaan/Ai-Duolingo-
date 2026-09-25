@@ -73,7 +73,8 @@ class AlpacaClient:
     def get_asset(self, symbol):
         return self._trade("GET", f"/assets/{quote(symbol, safe='')}")
 
-    def submit_entry(self, symbol, qty, side, take_profit, stop_loss, client_order_id=None, fractional=False):
+    def submit_entry(self, symbol, qty, side, take_profit, stop_loss, client_order_id=None, fractional=False,
+                     overnight=False):
         """Open a position. side is "buy" (long) or "sell" (short).
 
         Whole-share stock trades get a bracket order. Crypto and fractional shares can't
@@ -90,7 +91,7 @@ class AlpacaClient:
             "qty": str(qty),
             "side": side,
             "type": "market",
-            "time_in_force": "day",
+            "time_in_force": "gtc" if overnight else "day",  # gtc keeps an overnight hold's stop alive tomorrow
             "order_class": "bracket",
             "take_profit": {"limit_price": f"{take_profit:.2f}"},
             "stop_loss": {"stop_price": f"{stop_loss:.2f}"},
@@ -157,6 +158,18 @@ class AlpacaClient:
             "symbol": symbol, "qty": str(qty), "side": "sell", "type": "stop_limit",
             "stop_price": f"{stop_price:.6g}", "limit_price": f"{stop_price * 0.99:.6g}",
             "time_in_force": "gtc", "client_order_id": f"stop-{norm(symbol)}-{uuid.uuid4().hex[:8]}",
+        })
+
+    def submit_extended_exit(self, symbol, qty, side, limit_price):
+        """Limit order that can fill in pre-market, after-hours and the overnight session.
+        Cancels the position's other orders first (a bracket's stop holds the shares)."""
+        for order in self.get_open_orders() or []:
+            if norm(order["symbol"]) == norm(symbol):
+                self._trade("DELETE", f"/orders/{order['id']}")
+        return self._trade("POST", "/orders", json={
+            "symbol": symbol, "qty": str(abs(float(qty))), "side": side, "type": "limit",
+            "limit_price": f"{limit_price:.2f}", "time_in_force": "day", "extended_hours": True,
+            "client_order_id": f"protect-{norm(symbol)}-{uuid.uuid4().hex[:8]}",
         })
 
     def cancel_order(self, order_id):

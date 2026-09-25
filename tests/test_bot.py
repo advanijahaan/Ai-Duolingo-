@@ -9,9 +9,9 @@ from trading_bot.config import Config
 from trading_bot.risk import account_limits, daily_loss_hit, option_contracts, pick_option, position_size
 import tempfile
 
-from trading_bot.learner import Learner, backtest
+from trading_bot.learner import Learner, backtest, trail_stop
 from trading_bot.strategy import (STRATEGIES, Signal, annotate_sessions, atr, breakout, ema, intraday_momentum,
-                                   mean_reversion, mirror, orb, rsi, trend, vwap_trend)
+                                   mean_reversion, mirror, orb, overnight_hold, rsi, trend, vwap_trend)
 
 T0 = datetime(2026, 9, 24, 14, 0, tzinfo=timezone.utc)
 
@@ -144,6 +144,47 @@ class BacktestTests(unittest.TestCase):
             b["t"] = "2026-09-25" + b["t"][10:]
         bars[33]["c"] = 101.0
         self.assertEqual(backtest(scripted({32}), bars, cfg(cost_pct=0)), [0.5])
+
+
+class ExitRuleTests(unittest.TestCase):
+    def test_trail_stop(self):
+        c = cfg()
+        self.assertEqual(trail_stop(98, 100, 2, 101, c), 98)      # not ahead enough yet
+        self.assertEqual(trail_stop(98, 100, 2, 102, c), 100)     # +1R: stop to break-even
+        self.assertEqual(trail_stop(100, 100, 2, 105, c), 103)    # keeps 1R behind the best price
+
+    def test_backtest_trailing_stop_keeps_winner(self):
+        bars = make_bars([100.0] * 40)  # entry at bar 31's close: 100, stop 98 (risk 2), target 104
+        for i, (o, h, l, c) in zip(range(32, 36), [(100, 101, 100, 101), (101, 103, 101, 103),
+                                                    (103, 103.5, 102.5, 103), (103, 103, 101, 101)]):
+            bars[i].update(o=o, h=h, l=l, c=c)
+        # best price 103.5 drags the stop to 101.5, so the pullback sells at +0.75R instead of riding to 98
+        self.assertEqual(backtest(scripted({32}), bars, cfg(cost_pct=0, max_hold_minutes=0)), [0.75])
+
+    def test_backtest_time_limit(self):
+        bars = make_bars([100.0] * 80)
+        bars[40]["c"] = 101.0
+        # entry at bar 31; a 45-minute limit is 9 five-minute bars, so it sells at bar 40's close
+        self.assertEqual(backtest(scripted({32}), bars, cfg(cost_pct=0, max_hold_minutes=45)), [0.5])
+
+    def test_overnight_hold_buys_before_close_and_sells_after_open(self):
+        day = [(100, 100.3, 99.7, 100, 1000)] * 78
+        bars = session_days(4, day)
+        entry = [b for b in bars if b["_min"] == 15 * 60 + 45][0]
+        idx = bars.index(entry)
+        self.assertEqual(overnight_hold(bars[:idx + 1], cfg()).action, "buy")
+        first_bar = next(b for b in bars[idx:] if b["_min"] == 9 * 60 + 30)
+        self.assertEqual(overnight_hold(bars[:bars.index(first_bar) + 1], cfg()).action, "sell")
+
+    def test_backtest_holds_overnight_through_the_gap(self):
+        day = [(100, 100.3, 99.7, 100, 1000)] * 78
+        bars = session_days(4, day) + session_days(1, [(101, 101.3, 100.9, 101, 1000)] * 3)[-3:]
+        for b in bars[-3:]:
+            b["t"] = "2026-09-18" + b["t"][10:]
+            b.pop("_min", None)
+        annotate_sessions(bars)
+        results = backtest(overnight_hold, bars, cfg(cost_pct=0))
+        self.assertAlmostEqual(results[-1], 0.5)  # bought 100 at 15:50, sold 101 next morning, risk 2%
 
 
 class LearnerTests(unittest.TestCase):
@@ -376,12 +417,17 @@ class FakeClient:
     def cancel_order(self, order_id):
         self.canceled.append(order_id)
 
+    def submit_extended_exit(self, symbol, qty, side, limit_price):
+        self.extended_exits = getattr(self, "extended_exits", []) + [(symbol, qty, side, limit_price)]
+        return {"id": "ext1"}
+
     def submit_crypto_stop(self, symbol, qty, stop_price):
         self.stops = getattr(self, "stops", []) + [(symbol, qty, stop_price)]
         return {"id": f"stop{len(self.stops)}"}
 
-    def submit_entry(self, symbol, qty, side, tp, sl, client_order_id=None, fractional=False):
+    def submit_entry(self, symbol, qty, side, tp, sl, client_order_id=None, fractional=False, overnight=False):
         self.orders.append((symbol, qty, tp, sl))
+        self.overnight_flags = getattr(self, "overnight_flags", []) + [overnight]
         self.fractional_flags = getattr(self, "fractional_flags", []) + [fractional]
         self.sides = getattr(self, "sides", []) + [side]
         self.open_orders.append({"id": "e1", "symbol": symbol, "side": side, "client_order_id": client_order_id})
@@ -710,6 +756,59 @@ class BotTests(unittest.TestCase):
         bot = TradingBot(cfg(), learner=trend_learner(), client=client)  # no memory of buying it
         bot.run_once()
         self.assertEqual(client.closed, ["BTCUSD"])
+
+    # --- exits and overnight holds ---
+    def test_live_trailing_stop_and_time_limit(self):
+        client = FakeClient(make_bars(crossover_series()),
+                            positions=[{"symbol": "AAPL", "avg_entry_price": "100", "current_price": "103"},
+                                       {"symbol": "MSFT", "avg_entry_price": "100", "current_price": "100.5"}])
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        bot.open_trades["AAPL"] = {"strategy": "trend", "side": "long", "entry": 100.0, "stop": 98.0, "risk": 2.0,
+                                   "best": 105.0, "opened_at": client.now.isoformat().replace("+00:00", "Z")}
+        old = (client.now - timedelta(minutes=150)).isoformat().replace("+00:00", "Z")
+        bot.open_trades["MSFT"] = {"strategy": "trend", "side": "long", "entry": 100.0, "stop": 98.0, "risk": 2.0,
+                                   "opened_at": old}
+        bot.run_once()
+        self.assertEqual(sorted(client.closed), ["AAPL", "MSFT"])  # AAPL fell to its trailed stop 103; MSFT timed out
+
+    def test_end_of_day_keeps_overnight_hold(self):
+        client = FakeClient(make_bars(crossover_series()), minutes_to_close=5,
+                            positions=[{"symbol": "AAPL", "asset_class": "us_equity", "avg_entry_price": "100",
+                                        "current_price": "100"},
+                                       {"symbol": "MSFT", "asset_class": "us_equity", "avg_entry_price": "100",
+                                        "current_price": "100"}])
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        bot.open_trades["MSFT"] = {"strategy": "overnight_hold", "side": "long", "entry": 100.0, "stop": 98.0,
+                                   "opened_at": "x"}
+        bot.run_once()
+        self.assertEqual(client.closed, ["AAPL"])
+
+    def test_overnight_entry_just_before_close_uses_gtc_and_skips_day_trade_limit(self):
+        day = [(100, 100.3, 99.7, 100, 1000)] * 76  # up to the bar that closes at 15:50
+        bars = session_days(4, day)
+        c = cfg()
+
+        def fake_backtest(fn, bars, c, **kw):
+            return [1.0] * 10 if fn is overnight_hold and bars[0]["c"] <= 100 else [-1.0] * 10
+
+        client = FakeClient(bars, minutes_to_close=9, equity="1000", last_equity="1000", daytrade_count=3)
+        TradingBot(c, learner=Learner(c, backtester=fake_backtest), client=client).run_once()
+        self.assertEqual(len(client.orders), 1)
+        self.assertEqual(client.overnight_flags, [True])
+
+    def test_overnight_hold_protected_outside_market_hours(self):
+        client = FakeClient(make_bars(crossover_series()), is_open=False,
+                            positions=[{"symbol": "AAPL", "asset_class": "us_equity", "qty": "10",
+                                        "avg_entry_price": "100", "current_price": "97"}])
+        bot = TradingBot(cfg(), learner=trend_learner(), client=client)
+        bot.open_trades["AAPL"] = {"strategy": "overnight_hold", "side": "long", "entry": 100.0, "stop": 98.0,
+                                   "opened_at": "x"}
+        bot.run_once()
+        bot.run_once()  # only one protective order
+        self.assertEqual(len(client.extended_exits), 1)
+        symbol, qty, side, limit = client.extended_exits[0]
+        self.assertEqual((symbol, side), ("AAPL", "sell"))
+        self.assertLess(limit, 97)
 
     def test_drops_forming_bar(self):
         bars = make_bars([1, 2, 3])

@@ -17,9 +17,13 @@ from datetime import datetime, timedelta
 
 from .alpaca_client import AlpacaClient, AlpacaError, is_crypto, norm
 from .config import Config
-from .learner import Learner
+from .learner import Learner, trail_stop
 from .risk import account_limits, daily_loss_hit, option_contracts, pick_option, position_size
 from .strategy import LONG_STRATEGIES, STRATEGIES, annotate_sessions
+
+
+def _overnight(strategy_name):
+    return bool(strategy_name) and getattr(STRATEGIES.get(strategy_name), "overnight", False)
 
 log = logging.getLogger("trading_bot")
 
@@ -137,7 +141,8 @@ class TradingBot:
         if not self.limits.pdt_limited:
             return math.inf
         opened_today = sum(1 for sym, t in self.open_trades.items()
-                           if not is_crypto(sym) and t.get("opened_at", "")[:10] == today.isoformat())
+                           if not is_crypto(sym) and not _overnight(t.get("strategy"))
+                           and t.get("opened_at", "")[:10] == today.isoformat())
         return self.cfg.pdt_max_day_trades - int(account.get("daytrade_count") or 0) - opened_today
 
     @staticmethod
@@ -189,17 +194,21 @@ class TradingBot:
 
         self._check_managed_exits(positions)
         self._close_disabled_crypto(positions)
+        if stock_open:
+            self._manage_open_trades(positions, now)
+        else:
+            self._protect_overnight_holds(positions)
 
         symbols = list(self.cfg.crypto_symbols)
         if stock_open:
             if minutes_to_close <= self.cfg.flatten_minutes:
                 for order in entry_orders:
-                    if not is_crypto(order["symbol"]):
+                    overnight = _overnight(order.get("client_order_id", "").split("-")[0])
+                    if not is_crypto(order["symbol"]) and not overnight:
                         self._act(f"CANCEL unfilled {order['symbol']} entry (end of day)",
                                   lambda o=order: self.client.cancel_order(o["id"]))
                 self._flatten(positions, "end of day", stocks_only=True)
-            else:
-                symbols = self.stock_universe(now) + symbols
+            symbols = self.stock_universe(now) + symbols
 
         # 1) fetch new bars
         fresh = {}
@@ -237,7 +246,9 @@ class TradingBot:
             except AlpacaError as exc:
                 log.error("%s: %s", symbol, exc)
                 continue
-            if candidate and (is_crypto(symbol) or stock_entries):
+            # overnight holds are bought in the last minutes before the close, after other entries stop
+            late_ok = stock_open and minutes_to_close > 2 and candidate and _overnight(candidate[2])
+            if candidate and (is_crypto(symbol) or stock_entries or late_ok):
                 candidates.append(candidate)
         candidates.sort(key=lambda c: -c[0])
         for i, (score, symbol, choice, signal, bars) in enumerate(candidates):
@@ -323,11 +334,12 @@ class TradingBot:
     def _enter(self, symbol, choice, signal, bars, account, positions, pending, today):
         key = norm(symbol)
         crypto = is_crypto(symbol)
-        if not crypto and self._day_trades_left(account, today) < 1:
+        overnight = _overnight(choice)
+        if not crypto and not overnight and self._day_trades_left(account, today) < 1:
             log.info("%s: skipping, no day trades left this week (small-account rule)", symbol)
             return
 
-        if symbol in self.cfg.options_underlyings and self.limits.options:
+        if symbol in self.cfg.options_underlyings and self.limits.options and not overnight:
             if self._enter_option(symbol, choice, signal, bars, account):
                 pending.add(key)
                 return
@@ -355,13 +367,13 @@ class TradingBot:
             f"{'BUY' if order_side == 'buy' else 'SHORT'} {qty} {symbol} @ ~{signal.price:.4g} "
             f"stop {signal.stop:.4g} target {signal.target:.4g} ({choice})",
             lambda: self.client.submit_entry(symbol, qty, order_side, signal.target, signal.stop, order_id,
-                                             fractional=fractional),
+                                             fractional=fractional, overnight=overnight),
         )
         pending.add(key)
         if not self.dry_run:
             self.open_trades[symbol] = {"strategy": choice, "side": signal.side, "entry": signal.price,
                                         "stop": signal.stop, "target": signal.target, "opened_at": bars[-1]["t"],
-                                        "managed": crypto or fractional}
+                                        "risk": abs(signal.price - signal.stop), "managed": crypto or fractional}
 
     def _enter_option(self, symbol, choice, signal, bars, account):
         """Buy a call (bullish) or put (bearish). Returns False if no good contract was found."""
@@ -420,6 +432,55 @@ class TradingBot:
                           lambda k=key: self.client.close_position(k))
                 positions.pop(key)
 
+    def _manage_open_trades(self, positions, now):
+        """Every loop during market hours: trail each stock trade's stop once it's ahead, and close
+        trades that have run past max_hold_minutes (except orb, intraday_momentum and overnight holds)."""
+        for symbol, trade in list(self.open_trades.items()):
+            pos = positions.get(norm(symbol))
+            if not pos or trade.get("underlying") or is_crypto(symbol):
+                continue
+            price = float(pos["current_price"])
+            entry, risk = trade["entry"], trade.get("risk") or abs(trade["entry"] - trade["stop"])
+            short = trade.get("side") == "short"
+            if short:  # mirror the long rules
+                trade["best"] = min(trade.get("best", entry), price)
+                flipped = -trail_stop(-trade["stop"], -entry, risk, -trade["best"], self.cfg)
+                trade["stop"], hit = flipped, price >= flipped
+            else:
+                trade["best"] = max(trade.get("best", entry), price)
+                trade["stop"] = trail_stop(trade["stop"], entry, risk, trade["best"], self.cfg)
+                hit = price <= trade["stop"]
+            fn = STRATEGIES.get(trade.get("strategy"))
+            timed = (self.cfg.max_hold_minutes and not getattr(fn, "hold_to_close", False)
+                     and not getattr(fn, "overnight", False) and trade.get("opened_at", "").endswith("Z")
+                     and now - _parse_ts(trade["opened_at"]) >= timedelta(minutes=self.cfg.max_hold_minutes))
+            if hit or timed:
+                why = "trailing stop" if hit else f"held {self.cfg.max_hold_minutes} minutes"
+                try:
+                    self._act(f"EXIT {symbol} @ ~{price:.4g} ({why})", lambda s=symbol: self.client.close_position(s))
+                    positions.pop(norm(symbol))
+                except AlpacaError as exc:
+                    log.error("%s: %s", symbol, exc)
+
+    def _protect_overnight_holds(self, positions):
+        """Outside market hours stop orders don't work, so if an overnight hold falls through its stop in
+        pre-market, after-hours or the overnight session, sell it with an extended-hours limit order."""
+        for symbol, trade in self.open_trades.items():
+            pos = positions.get(norm(symbol))
+            if not pos or not _overnight(trade.get("strategy")) or trade.get("protective_order_id"):
+                continue
+            price = float(pos["current_price"])
+            short = trade.get("side") == "short"
+            if (price >= trade["stop"]) if short else (price <= trade["stop"]):
+                limit = price * (1.005 if short else 0.995)  # a little past the last price so it fills
+                try:
+                    self._act(f"{'COVER' if short else 'SELL'} {symbol} @ limit {limit:.2f} "
+                              f"(fell through its stop outside market hours)",
+                              lambda s=symbol, q=pos["qty"], l=limit: trade.update(
+                                  protective_order_id=self.client.submit_extended_exit(s, q, "buy" if short else "sell", l)["id"]))
+                except AlpacaError as exc:
+                    log.error("%s: %s", symbol, exc)
+
     def _check_managed_exits(self, positions):
         """Crypto and options have no bracket orders, so enforce their stop-loss and take-profit here every loop."""
         for symbol, trade in self.open_trades.items():
@@ -448,7 +509,7 @@ class TradingBot:
             # None if the entry never filled
             exit_price = self.client.get_last_exit_fill(symbol, trade["opened_at"], "buy" if short else "sell")
             if exit_price is not None:
-                risk = abs(trade["entry"] - trade["stop"])
+                risk = trade.get("risk") or abs(trade["entry"] - trade["stop"])
                 r = ((trade["entry"] - exit_price) if short else (exit_price - trade["entry"])) / risk
                 log.info("%s: trade closed at %.4g, %+.2fR -> learning for %s", symbol, exit_price, r, trade["strategy"])
                 self.learner.record_trade(trade.get("underlying", symbol), trade["strategy"], r)
@@ -456,7 +517,13 @@ class TradingBot:
             self.learner.save()
 
     def _flatten(self, positions, reason, stocks_only):
-        targets = [p["symbol"] for p in positions.values() if not (stocks_only and p.get("asset_class") == "crypto")]
+        """stocks_only (end of day): sell every stock and option except overnight holds; else sell everything."""
+        def kept(p):
+            if not stocks_only:
+                return False
+            trade = self.open_trades.get(p["symbol"]) or {}
+            return p.get("asset_class") == "crypto" or _overnight(trade.get("strategy"))
+        targets = [p["symbol"] for p in positions.values() if not kept(p)]
         if not targets:
             return
         if stocks_only:

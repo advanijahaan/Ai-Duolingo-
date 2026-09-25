@@ -218,6 +218,9 @@ def short_version(fn):
                        reason=f"{sig.reason} (on flipped chart)")
     short.__name__ = fn.__name__ + "_short"
     short.base = fn
+    for flag in ("hold_to_close", "overnight"):
+        if hasattr(fn, flag):
+            setattr(short, flag, getattr(fn, flag))
     return short
 
 
@@ -283,6 +286,27 @@ def intraday_momentum(bars, cfg):
     return Signal("hold", price=b["c"], reason=f"first half hour {first_half_hour:+.2%}")
 
 
-LONG_STRATEGIES.update({"orb": orb, "vwap_trend": vwap_trend, "intraday_momentum": intraday_momentum})
+def overnight_hold(bars, cfg):
+    """Overnight drift (Cliff, Cooper & Gulen, "Like Night and Day"): historically most of the US market's
+    gains came between the close and the next open. Buy just before the close, sell after the next open."""
+    b = _session(bars)
+    if b is None:
+        return Signal("hold", reason="needs stock session data")
+    if b["_min"] < OPEN_MIN + cfg.overnight_exit_after_minutes:
+        return Signal("sell", price=b["c"], reason="morning after an overnight hold")
+    if b["_min"] == cfg.overnight_entry_minute:
+        price = b["c"]
+        stop = price * (1 - cfg.overnight_stop_pct)
+        return Signal("buy", price=price, stop=stop, target=price * (1 + 10 * cfg.overnight_stop_pct),
+                      reason="holding overnight into the next open")
+    return Signal("hold", price=b["c"], reason="waits for the close")
+
+
+orb.hold_to_close = True
+intraday_momentum.hold_to_close = True
+overnight_hold.overnight = True
+
+LONG_STRATEGIES.update({"orb": orb, "vwap_trend": vwap_trend, "intraday_momentum": intraday_momentum,
+                        "overnight_hold": overnight_hold})
 STRATEGIES = dict(LONG_STRATEGIES)
 STRATEGIES.update({f"{name}_short": short_version(fn) for name, fn in LONG_STRATEGIES.items()})

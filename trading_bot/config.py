@@ -107,6 +107,15 @@ class Config:
     # intraday momentum
     im_entry_minute: int = 15 * 60 + 25  # the bar that closes at 15:30 New York time
     im_min_move: float = 0.0
+    # overnight hold
+    overnight_entry_minute: int = 15 * 60 + 45  # the bar that closes at 15:50 New York time
+    overnight_exit_after_minutes: int = 5       # sell once the first 5 minutes after the open have closed
+    overnight_stop_pct: float = 0.02            # also sells in pre-market/after-hours if it falls this far
+
+    # Exits for every trade: trail the stop once ahead, and don't sit in a trade all day
+    trail_start_r: float = 1.0       # once up by 1x the amount risked...
+    trail_r: float = 1.0             # ...keep the stop 1x the risk below the best price since entry
+    max_hold_minutes: int = 120      # sell after 2 hours (not for orb / intraday_momentum / overnight_hold)
 
     # Learning: which strategy each symbol uses
     learn_days: int = 10          # calendar days of history to replay each strategy on
